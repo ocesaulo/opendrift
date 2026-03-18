@@ -221,6 +221,15 @@ class SedimentDrift(OceanDrift):
                 'level': CONFIG_LEVEL_ESSENTIAL
             }})
 
+        self._add_config({
+            'vertical_mixing:debug_disable_bottom_stress': {
+                'type': 'bool',
+                'default': False,
+                'description':
+                'Disable bottom-stress forcing in resuspension (debug only, non-physical).',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+
 
         # By default, sediments do not strand towards coastline
         # TODO: A more sophisticated stranding algorithm is needed
@@ -230,6 +239,7 @@ class SedimentDrift(OceanDrift):
         self._set_config_default('drift:vertical_mixing', True)
 
         self.use_parallel = True
+        self._warned_bottom_stress_disabled = False
 
     def update(self):
         """Update positions and properties of sediment particles.
@@ -251,19 +261,10 @@ class SedimentDrift(OceanDrift):
 
         if self.get_config('drift:vertical_mixing') is False:
             self.vertical_buoyancy()
-            # self.vertical_advection()
         else:
             self.vertical_mixing() # including buoyancy and settling
 
-
-        self.deactivate_elements_outofbounds()       
-
-        # upwards_moving_particles = self.elements.counter == 1
-        # Restore downwards velocity to resuspended particles
-        # self.elements.terminal_velocity[upwards_moving_particles] = self.elements.terminal_velocity_default[upwards_moving_particles]
-        # self.elements.counter[upwards_moving_particles] = 0
-
-        # self.resuspension()
+        self.deactivate_elements_outofbounds()
         self.deactivate_elements(self.elements.beached == 1, reason='beached')
         self.remove_deactivated_elements()
 
@@ -280,7 +281,6 @@ class SedimentDrift(OceanDrift):
         lons, lats = self.elements.lon, self.elements.lat
         out_of_bounds = (lons < lon_min) | (lons > lon_max) | (lats < lat_min) | (lats > lat_max)
         self.deactivate_elements(out_of_bounds, reason='out of bounds')
-        # self.remove_deactivated_elements()
 
     def bottom_interaction(self, seafloor_depth):
         """Sub method of vertical_mixing and vertical_buoyancy, determines settling"""
@@ -292,38 +292,26 @@ class SedimentDrift(OceanDrift):
             logger.debug('Settling %s elements at seafloor' % np.sum(settling))
             self.elements.moving[settling] = 0
             self.elements.settled[settling] = 1
-            #  self.get_distance_cell_center_above(settling)  # no longer needed here
 
     def resuspension(self):
         """Resuspending elements when critical shear stress is exceed"""
-        ## Old resuspension condition
-        # threshold = self.get_config('vertical_mixing:resuspension_threshold')
-        # resuspending = np.logical_and(self.current_speed() > threshold, self.elements.moving==0)
-
         threshold = self.elements.tau_crit  # tau_crit should become a function of the element and environment
 
         settled = np.logical_and(self.elements.moving == 0, self.elements.settled == 1)
         if np.sum(settled) > 0:
-            bottom_stress = self.calc_bottom_stress(settled)
+            turnoff = self.get_config('vertical_mixing:debug_disable_bottom_stress')
+            bottom_stress = self.calc_bottom_stress(settled, turnoff=turnoff)
             resuspending = np.logical_and(bottom_stress > threshold, settled)
         else:
             return
-            #  resuspending = settled
         
         if np.sum(resuspending) > 0:
             # Keep track of how many times particle has been resuspended
             self.elements.times_resuspended[resuspending] = self.elements.times_resuspended[resuspending] + 1
             # Allow moving again
             self.elements.moving[resuspending] = 1
-            # Since not at bottom anymore, set distance to nearest cell center above to 99999
-            # self.elements.dz_bot[resuspending] = 99999.0  # no longer needed here
-            # Give particle upwards velocity
-            # self.elements.terminal_velocity[resuspending] = self.calc_upward_resuspension_velocity(bottom_stress, resuspending)
-            # Keep track of number of time steps particle has been in resuspension for (however, it is always 1 dt)
-            # self.elements.counter[resuspending] = 1  # should be improved - a nominal dt is too long for being resuspended, maybe as a var called in_resuspension that sends these elements to a small loop like v-mix
             # Calculate the particle z position from height above bottom following particle motion scheme.
             height_above_bottom = self.calc_resuspension_depth(bottom_stress, resuspending)
-            # print(np.max(height_above_bottom))
             new_z = self.elements.z[resuspending] + height_above_bottom
             new_z[new_z > 0] = 0
             # Update the z position of the particle
@@ -333,7 +321,7 @@ class SedimentDrift(OceanDrift):
             # keep track of the latest resuspension height:
             self.elements.latest_resuspension_height[resuspending] = height_above_bottom
 
-    def calc_bottom_stress(self, idxs):
+    def calc_bottom_stress(self, idxs, turnoff=False):
         """
         Compute bottom stress for a set of particles (or grid cells) identified by the boolean mask `idxs`.
         The returned array has the same shape as the full elements array. For indices not included in `idxs`,
@@ -342,6 +330,12 @@ class SedimentDrift(OceanDrift):
         This function uses a vectorized search (via np.searchsorted) to locate the appropriate vertical
         cell for each active particle, then computes the bottom stress with the same logic as before.
         """
+        if turnoff:
+            if self._warned_bottom_stress_disabled is False:
+                logger.warning('Bottom stress calculation disabled by config vertical_mixing:debug_disable_bottom_stress')
+                self._warned_bottom_stress_disabled = True
+            return np.zeros(self.elements.z.shape)
+
         # 1. Extract data only for active particles (where idxs is True)
         floor_idx = np.where(idxs)[0]  # indices in the full array that are active
         if floor_idx.size == 0:
@@ -375,14 +369,6 @@ class SedimentDrift(OceanDrift):
         dz_bot_min = 0.1                # minimum allowed thickness (m)
         crit_last_layer_thickness = 1.  # threshold for turbulent contribution
 
-        # Allocate arrays of length n_active for near-bottom quantities.
-        # (They will be filled with vectorized operations below.)
-        u_bot    = np.empty(n_active)
-        v_bot    = np.empty(n_active)
-        visc_bot = np.empty(n_active)
-        dz_bot   = np.full(n_active, dz_bot_min)
-        turb_contrib = np.zeros(n_active)
-
         # 3. Find the near-bottom level for each active particle
         #
         # For each active particle with seafloor depth `adep` (from el_seafloor_depth_z),
@@ -404,33 +390,32 @@ class SedimentDrift(OceanDrift):
         # 4. Extract near-bottom values from the profile arrays.
         # We assume that env_profs['x_sea_water_velocity'], etc., have shape (n_levels, n_active)
         particle_range = np.arange(n_active)
-        u_bot    = env_profs['x_sea_water_velocity'][selected_idx, particle_range]
-        v_bot    = env_profs['y_sea_water_velocity'][selected_idx, particle_range]
-        visc_bot = env_profs['ocean_vertical_diffusivity'][selected_idx, particle_range]
+
+        u = env_profs['x_sea_water_velocity'][selected_idx, particle_range]
+        v = env_profs['y_sea_water_velocity'][selected_idx, particle_range]
+        visc = env_profs['ocean_vertical_diffusivity'][selected_idx, particle_range]
 
         # Compute the local layer thickness for each active particle.
-        dz_bot = zgrid[selected_idx] - el_seafloor_depth_z
+        dz_bot = np.maximum(zgrid[selected_idx] - el_seafloor_depth_z, dz_bot_min)
 
         # Log a debug message for any particle that got the fallback index.
         fallback = (search_indices == 0)
         if np.any(fallback):
-            for i in np.where(fallback)[0]:
-                self.elements.beached[floor_idx[i]] = 1
-                logger.debug('Element %s settled at seafloor shallower than shallowest grid cell' %
-                            self.elements.ID[floor_idx[i]])
+            self.elements.beached[floor_idx[fallback]] = 1
 
         # 5. Compute the bottom stress using the same formulas as before
         r_b = 0
         c_d = 0.0021  # drag coefficient (to be updated later for a log-wall model)
-        _2KE = u_bot**2 + v_bot**2  # twice the kinetic energy (ignoring vertical velocity)
+        _2KE = u**2 + v**2  # twice the kinetic energy (ignoring vertical velocity)
         vel_mag = np.sqrt(_2KE)
 
         # Turbulent contribution is computed only if the layer thickness is above a threshold.
         turb_layers = dz_bot >= crit_last_layer_thickness
-        turb_contrib[turb_layers] = 2 * visc_bot[turb_layers] / dz_bot[turb_layers] * vel_mag[turb_layers]
+        turb_contrib = np.zeros(n_active)
+        turb_contrib[turb_layers] = 2 * visc[turb_layers] / dz_bot[turb_layers] * vel_mag[turb_layers]
 
         # Mean-flow contribution (as in the original code)
-        mean_flow_contrib = (r_b + c_d * np.sqrt(_2KE)) * vel_mag
+        mean_flow_contrib = (r_b + c_d * vel_mag) * vel_mag
         bottom_stress_pseudo_energy_magnitude = mean_flow_contrib + turb_contrib
 
         # Multiply by the sea water density.
@@ -479,7 +464,7 @@ class SedimentDrift(OceanDrift):
         mu = self.elements.viscosity_molecular[resuspending]
 
         n_resuspending = np.count_nonzero(resuspending)
-        print(n_resuspending, 'resuspending particles')
+        # print(n_resuspending, 'resuspending particles')
         if n_resuspending > 300:
             n_jobs = 2
 
@@ -495,114 +480,6 @@ class SedimentDrift(OceanDrift):
             z_final_all[idx_local] = z_local
 
         return z_final_all
-
-
-    # def particle_motion_vectorized(self, t, y_flat, params):
-    #     """
-    #     Vectorized ODE right-hand side.
-        
-    #     Parameters:
-    #     - t: time (scalar)
-    #     - y_flat: flattened state array of length 2*n_particles. It is assumed
-    #                 that the first n entries are z for each particle and the next n entries are w.
-    #     - params: tuple of parameter arrays:
-    #         (Cl, rho_f, rho_s, u_star, r, mu, g)
-    #         each of shape (n_particles,)
-        
-    #     Returns:
-    #     - dydt_flat: flattened derivative array of the same length.
-    #     """
-    #     # Determine the number of particles.
-    #     n = y_flat.size // 2
-    #     # Reshape the state: first row is z, second is w.
-    #     y = y_flat.reshape((2, n))
-    #     z = y[0, :]   # particle positions
-    #     w = y[1, :]   # particle velocities
-        
-    #     # Unpack parameter arrays.
-    #     Cl, rho_f, rho_s, u_star, r, mu, g = params
-        
-    #     # Prevent division by zero: if z == 0, substitute a small value.
-    #     z_fixed = np.where(z == 0, 1e-8, z)
-        
-    #     # Compute the force terms:
-    #     # Lift force term.
-    #     lift_term = (0.5 * 3 * Cl * rho_f / (4 * r * rho_s)) * (u_star**2 * (np.log(2))**2) / (z_fixed**2)
-    #     # Gravity/buoyancy term.
-    #     gravity_term = g * (1 - rho_f / rho_s)
-    #     # Drag force term.
-    #     drag_term = (9 * mu / (2 * r**2 * rho_s)) * w
-        
-    #     # Compute derivatives.
-    #     dw_dt = lift_term - gravity_term - drag_term
-    #     dz_dt = w  # time derivative of z is the velocity w
-        
-    #     # Stack derivatives into a 2 x n array and flatten it.
-    #     dydt = np.vstack((dz_dt, dw_dt))
-    #     return dydt.flatten()
-
-    # def calc_resuspension_depth(self, bottom_stress, resuspending):
-    #     """
-    #     Compute the resuspension depth (i.e. the final particle z position) using a vectorized
-    #     ODE integration for all active particles (where resuspending is True). The integration
-    #     is performed in one batch call to solve_ivp.
-        
-    #     For inactive particles (where resuspending is False), the output is set to NaN.
-    #     """
-    #     gravity = 9.81
-
-    #     # Extract environmental parameters for active particles.
-    #     temp = self.environment['sea_water_temperature'][resuspending]
-    #     sal = self.environment['sea_water_salinity'][resuspending]
-    #     rho_f = self.sea_water_density(temp, sal)
-
-    #     C_l = self.elements.C_l[resuspending]
-    #     rho_s = self.elements.rho_s[resuspending]
-    #     bot_stress = bottom_stress[resuspending]
-        
-    #     u_star = np.sqrt(bot_stress / rho_f)
-    #     r = self.elements.grain_diameter[resuspending] / 2
-    #     mu = self.elements.viscosity_molecular[resuspending]
-
-    #     # Initial conditions for the ODE.
-    #     z0_offset = 1e-8
-    #     z0_base = 1e-3  # roughness height
-    #     z0_initial = z0_base + z0_offset
-    #     n_active = np.count_nonzero(resuspending)
-    #     print(n_active, 'resuspending particles')
-        
-    #     # Build initial condition arrays for active particles.
-    #     z0_array = np.full(n_active, z0_initial)
-    #     w0_array = np.zeros(n_active)
-        
-    #     # Arrange the state as a 2 x n_active array and flatten it.
-    #     y0 = np.vstack((z0_array, w0_array)).flatten()
-        
-    #     # Integration settings.
-    #     npts = 100
-    #     t_end = 120  # integration time in seconds
-    #     t_span = (0, t_end)
-    #     t_eval = np.linspace(t_span[0], t_span[1], npts)
-        
-    #     # Pack parameters for all active particles into arrays.
-    #     # Each parameter array should have shape (n_active,).
-    #     params = (C_l, rho_f, rho_s, u_star, r, mu, np.full(n_active, gravity))
-        
-    #     # Solve the ODE system for all active particles in one call.
-    #     sol = solve_ivp(
-    #         fun=lambda t, y: self.particle_motion_vectorized(t, y, params),
-    #         t_span=t_span, y0=y0, t_eval=t_eval, method='BDF',
-    #         rtol=1e-1, atol=1e-5    )
-        
-    #     if not sol.success:
-    #         raise RuntimeError("ODE integration failed: " + sol.message)
-        
-    #     # The final state is given by sol.y[:, -1] with shape (2*n_active,).
-    #     # Reshape it into a 2 x n_active array.
-    #     final_state = sol.y[:, -1].reshape((2, n_active))
-    #     z_final = final_state[0, :]  # Extract the final z positions for all active particles.
-        
-    #     return z_final
 
 
     def calc_upward_resuspension_velocity(self, bottom_stress, resuspending):
