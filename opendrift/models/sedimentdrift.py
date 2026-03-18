@@ -27,8 +27,58 @@ from opendrift.config import CONFIG_LEVEL_ESSENTIAL, CONFIG_LEVEL_BASIC, CONFIG_
 from datetime import datetime
 from scipy.integrate import solve_ivp
 from joblib import Parallel, delayed
-from multiprocessing import cpu_count
 import math
+
+
+def particle_motion_vectorized(t, y_flat, params):
+    n = y_flat.size // 2
+    y = y_flat.reshape((2, n))
+    z = y[0, :]
+    w = y[1, :]
+
+    Cl, rho_f, rho_s, u_star, r, mu, g = params
+    z_fixed = np.where(z == 0, 1e-8, z)
+
+    lift_term = (0.5 * 3 * Cl * rho_f / (4 * r * rho_s)) * (u_star**2 * (np.log(2))**2) / (z_fixed**2)
+    gravity_term = g * (1 - rho_f / rho_s)
+    drag_term = (9 * mu / (2 * r**2 * rho_s)) * w
+
+    dw_dt = lift_term - gravity_term - drag_term
+    dz_dt = w
+    dydt = np.vstack((dz_dt, dw_dt))
+    return dydt.flatten()
+
+
+def solve_batch(batch, rho_f, rho_s, C_l, mu, grain_diameter, bot_stress, rtol, atol, dameth):
+    gravity = 9.81
+    rho_f_b = rho_f[batch]
+    rho_s_b = rho_s[batch]
+    C_l_b = C_l[batch]
+    mu_b = mu[batch]
+
+    r = grain_diameter[batch] / 2
+    u_star = np.sqrt(bot_stress[batch] / rho_f_b)
+    g_b = np.full_like(r, gravity)
+
+    z0_offset = 1e-8
+    z0_base = 1e-3
+    z0_initial = z0_base + z0_offset
+    z0 = np.full(len(batch), z0_initial)
+    w0 = np.zeros(len(batch))
+    y0 = np.vstack((z0, w0)).flatten()
+    params = (C_l_b, rho_f_b, rho_s_b, u_star, r, mu_b, g_b)
+
+    sol = solve_ivp(
+        fun=lambda t, y: particle_motion_vectorized(t, y, params),
+        t_span=(0, 120), y0=y0, method=dameth,
+        rtol=rtol, atol=atol
+    )
+
+    if not sol.success:
+        raise RuntimeError("ODE integration failed: " + sol.message)
+
+    final_state = sol.y[:, -1].reshape((2, len(batch)))
+    return batch, final_state[0, :]
 
 
 class SedimentElement(Lagrangian3DArray):
@@ -184,10 +234,13 @@ class SedimentDrift(OceanDrift):
     def update(self):
         """Update positions and properties of sediment particles.
         """
+        self.resuspension()
         # Advecting here all elements, but want to soon add
         # possibility of not moving settled elements, until
         # they are resuspended. May then need to send a boolean
         # array to advection methods below
+        # -- UPDATE: Lana/Saulo, we have added this functionality somewhat,
+        # the code still seems to waste time on the calculation maybe.
         self.advect_ocean_current()
 
         self.vertical_advection()
@@ -210,7 +263,7 @@ class SedimentDrift(OceanDrift):
         # self.elements.terminal_velocity[upwards_moving_particles] = self.elements.terminal_velocity_default[upwards_moving_particles]
         # self.elements.counter[upwards_moving_particles] = 0
 
-        self.resuspension()
+        # self.resuspension()
         self.deactivate_elements(self.elements.beached == 1, reason='beached')
         self.remove_deactivated_elements()
 
@@ -320,7 +373,7 @@ class SedimentDrift(OceanDrift):
         # For each active particle, we want to determine the local near-bottom cell.
         # Set minimum bottom layer thickness and a critical layer thickness.
         dz_bot_min = 0.1                # minimum allowed thickness (m)
-        crit_last_layer_thickness = 10.  # threshold for turbulent contribution
+        crit_last_layer_thickness = 1.  # threshold for turbulent contribution
 
         # Allocate arrays of length n_active for near-bottom quantities.
         # (They will be filled with vectorized operations below.)
@@ -410,76 +463,31 @@ class SedimentDrift(OceanDrift):
         return array[idx], idx
 
 
-    def get_optimal_n_jobs(fraction=0.75, max_jobs=None):
-        available = cpu_count()
-        jobs = int(available * fraction)
-        return min(jobs, max_jobs) if max_jobs else jobs
+    def calc_resuspension_depth(self, bottom_stress, resuspending, rtol=1e-1, atol=1e-5, dameth='BDF', batch_size=100, n_jobs=1):
 
-    def particle_motion_vectorized(t, y_flat, params):
-        n = y_flat.size // 2
-        y = y_flat.reshape((2, n))
-        z = y[0, :]
-        w = y[1, :]
+        # Extract environmental parameters for active particles.
+        temp = self.environment['sea_water_temperature'][resuspending]
+        sal = self.environment['sea_water_salinity'][resuspending]
+        rho_f = self.sea_water_density(temp, sal)
 
-        Cl, rho_f, rho_s, u_star, r, mu, g = params
-        z_fixed = np.where(z == 0, 1e-8, z)
+        C_l = self.elements.C_l[resuspending]
+        rho_s = self.elements.rho_s[resuspending]
+        
+        grain_diameter = self.elements.grain_diameter[resuspending]
+ 
+        bot_stress = bottom_stress[resuspending]
+        mu = self.elements.viscosity_molecular[resuspending]
 
-        lift_term = (0.5 * 3 * Cl * rho_f / (4 * r * rho_s)) * (u_star**2 * (np.log(2))**2) / (z_fixed**2)
-        gravity_term = g * (1 - rho_f / rho_s)
-        drag_term = (9 * mu / (2 * r**2 * rho_s)) * w
-
-        dw_dt = lift_term - gravity_term - drag_term
-        dz_dt = w
-        dydt = np.vstack((dz_dt, dw_dt))
-        return dydt.flatten()
-
-
-    def solve_batch(batch, grain_diameter, bottom_stress, rtol, atol, dameth):
-        gravity = 9.81
-        C_l = 0.5
-        rho_f = 1026.
-        rho_s = 2650.
-        mu = 1.4e-3
-
-        r = grain_diameter[batch] / 2
-        u_star = np.sqrt(bottom_stress[batch] / rho_f)
-
-        C_l_b = np.full_like(r, C_l)
-        rho_f_b = np.full_like(r, rho_f)
-        rho_s_b = np.full_like(r, rho_s)
-        mu_b = np.full_like(r, mu)
-        g_b = np.full_like(r, gravity)
-
-        z0 = np.full(len(batch), 1e-3 + 1e-8)
-        w0 = np.zeros(len(batch))
-        y0 = np.vstack((z0, w0)).flatten()
-        params = (C_l_b, rho_f_b, rho_s_b, u_star, r, mu_b, g_b)
-
-        sol = solve_ivp(
-            fun=lambda t, y: particle_motion_vectorized(t, y, params),
-            t_span=(0, 120), y0=y0, method=dameth,
-            rtol=rtol, atol=atol
-        )
-
-        if not sol.success:
-            raise RuntimeError("ODE integration failed: " + sol.message)
-
-        final_state = sol.y[:, -1].reshape((2, len(batch)))
-        return batch, final_state[0, :]
-
-    def calc_resuspension_depth(grain_diameter, bottom_stress, n_resuspending, rtol=1e-6, atol=1e-8, dameth='BDF', batch_size=500, n_jobs=-1):
-        if n_resuspending == 0:
-            return np.array([])
-
-        # Ensure inputs are arrays of length n_resuspending
-        grain_diameter = np.broadcast_to(grain_diameter, (n_resuspending,)) if np.isscalar(grain_diameter) else np.asarray(grain_diameter)
-        bottom_stress = np.broadcast_to(bottom_stress, (n_resuspending,)) if np.isscalar(bottom_stress) else np.asarray(bottom_stress)
+        n_resuspending = np.count_nonzero(resuspending)
+        print(n_resuspending, 'resuspending particles')
+        if n_resuspending > 300:
+            n_jobs = 2
 
         active_indices = np.arange(n_resuspending)
         batches = [active_indices[i:i+batch_size] for i in range(0, n_resuspending, batch_size)]
 
         results = Parallel(n_jobs=n_jobs, prefer='processes')(
-            delayed(solve_batch)(batch, grain_diameter, bottom_stress, rtol, atol, dameth) for batch in batches
+            delayed(solve_batch)(batch, rho_f, rho_s, C_l, mu, grain_diameter, bot_stress, rtol, atol, dameth) for batch in batches
         )
 
         z_final_all = np.full(n_resuspending, np.nan)
@@ -488,33 +496,62 @@ class SedimentDrift(OceanDrift):
 
         return z_final_all
 
-    # def particle_motion(self, t, y, Cl, rho_f, rho_s, u_star, r, mu, g):
-    #     z, w = y
-    #     if z == 0e0:
-    #         z = 1e-8  # Prevent division by zero
 
-    #     # Lift force
-    #     lift_term = (.5 * 3 * Cl * rho_f / (4 * r * rho_s)) * (u_star**2 * (np.log(2))**2) / z**2
-    #     # Gravity/Buoyancy force
+    # def particle_motion_vectorized(self, t, y_flat, params):
+    #     """
+    #     Vectorized ODE right-hand side.
+        
+    #     Parameters:
+    #     - t: time (scalar)
+    #     - y_flat: flattened state array of length 2*n_particles. It is assumed
+    #                 that the first n entries are z for each particle and the next n entries are w.
+    #     - params: tuple of parameter arrays:
+    #         (Cl, rho_f, rho_s, u_star, r, mu, g)
+    #         each of shape (n_particles,)
+        
+    #     Returns:
+    #     - dydt_flat: flattened derivative array of the same length.
+    #     """
+    #     # Determine the number of particles.
+    #     n = y_flat.size // 2
+    #     # Reshape the state: first row is z, second is w.
+    #     y = y_flat.reshape((2, n))
+    #     z = y[0, :]   # particle positions
+    #     w = y[1, :]   # particle velocities
+        
+    #     # Unpack parameter arrays.
+    #     Cl, rho_f, rho_s, u_star, r, mu, g = params
+        
+    #     # Prevent division by zero: if z == 0, substitute a small value.
+    #     z_fixed = np.where(z == 0, 1e-8, z)
+        
+    #     # Compute the force terms:
+    #     # Lift force term.
+    #     lift_term = (0.5 * 3 * Cl * rho_f / (4 * r * rho_s)) * (u_star**2 * (np.log(2))**2) / (z_fixed**2)
+    #     # Gravity/buoyancy term.
     #     gravity_term = g * (1 - rho_f / rho_s)
-    #     # Drag force
+    #     # Drag force term.
     #     drag_term = (9 * mu / (2 * r**2 * rho_s)) * w
-    #     # Acceleration
+        
+    #     # Compute derivatives.
     #     dw_dt = lift_term - gravity_term - drag_term
-    #     dz_dt = w
-    #     return np.array([dz_dt, dw_dt])
-
-
-    # def solve_particle_motion(self, params, y0, t_span, t_eval):
-    #     """ Wrapper to call solve_ivp for each particle. """
-    #     solution = solve_ivp(self.particle_motion, t_span, y0, t_eval=t_eval,
-    #                         args=params, method="BDF", rtol=1e-6, atol=1e-8)
-    #     return solution.y[0][-1], solution.y[1][-1]
-
+    #     dz_dt = w  # time derivative of z is the velocity w
+        
+    #     # Stack derivatives into a 2 x n array and flatten it.
+    #     dydt = np.vstack((dz_dt, dw_dt))
+    #     return dydt.flatten()
 
     # def calc_resuspension_depth(self, bottom_stress, resuspending):
+    #     """
+    #     Compute the resuspension depth (i.e. the final particle z position) using a vectorized
+    #     ODE integration for all active particles (where resuspending is True). The integration
+    #     is performed in one batch call to solve_ivp.
+        
+    #     For inactive particles (where resuspending is False), the output is set to NaN.
+    #     """
     #     gravity = 9.81
 
+    #     # Extract environmental parameters for active particles.
     #     temp = self.environment['sea_water_temperature'][resuspending]
     #     sal = self.environment['sea_water_salinity'][resuspending]
     #     rho_f = self.sea_water_density(temp, sal)
@@ -527,133 +564,46 @@ class SedimentDrift(OceanDrift):
     #     r = self.elements.grain_diameter[resuspending] / 2
     #     mu = self.elements.viscosity_molecular[resuspending]
 
-    #     z0 = 1e-3  # Roughness height
-    #     z0_initial = z0 + 1e-8
-    #     w0_initial = 0
-    #     y0 = [z0_initial, w0_initial]
-
+    #     # Initial conditions for the ODE.
+    #     z0_offset = 1e-8
+    #     z0_base = 1e-3  # roughness height
+    #     z0_initial = z0_base + z0_offset
+    #     n_active = np.count_nonzero(resuspending)
+    #     print(n_active, 'resuspending particles')
+        
+    #     # Build initial condition arrays for active particles.
+    #     z0_array = np.full(n_active, z0_initial)
+    #     w0_array = np.zeros(n_active)
+        
+    #     # Arrange the state as a 2 x n_active array and flatten it.
+    #     y0 = np.vstack((z0_array, w0_array)).flatten()
+        
+    #     # Integration settings.
     #     npts = 100
-    #     t_end = 120
+    #     t_end = 120  # integration time in seconds
     #     t_span = (0, t_end)
     #     t_eval = np.linspace(t_span[0], t_span[1], npts)
+        
+    #     # Pack parameters for all active particles into arrays.
+    #     # Each parameter array should have shape (n_active,).
+    #     params = (C_l, rho_f, rho_s, u_star, r, mu, np.full(n_active, gravity))
+        
+    #     # Solve the ODE system for all active particles in one call.
+    #     sol = solve_ivp(
+    #         fun=lambda t, y: self.particle_motion_vectorized(t, y, params),
+    #         t_span=t_span, y0=y0, t_eval=t_eval, method='BDF',
+    #         rtol=1e-1, atol=1e-5    )
+        
+    #     if not sol.success:
+    #         raise RuntimeError("ODE integration failed: " + sol.message)
+        
+    #     # The final state is given by sol.y[:, -1] with shape (2*n_active,).
+    #     # Reshape it into a 2 x n_active array.
+    #     final_state = sol.y[:, -1].reshape((2, n_active))
+    #     z_final = final_state[0, :]  # Extract the final z positions for all active particles.
+        
+    #     return z_final
 
-    #     params_list = [(C_l[i], rho_f[i], rho_s[i], u_star[i], r[i], mu[i], gravity) for i in range(len(rho_f))]
-
-    #     if self.use_parallel:
-    #         results = Parallel(n_jobs=-1, prefer="threads")(
-    #             delayed(self.solve_particle_motion)(params, y0, t_span, t_eval) for params in params_list
-    #         )
-    #     else:
-    #         results = [self.solve_particle_motion(params, y0, t_span, t_eval) for params in params_list]
-
-    #     zend, wend = zip(*results)
-    #     return np.array(zend)
-
-    def particle_motion_vectorized(self, t, y_flat, params):
-        """
-        Vectorized ODE right-hand side.
-        
-        Parameters:
-        - t: time (scalar)
-        - y_flat: flattened state array of length 2*n_particles. It is assumed
-                    that the first n entries are z for each particle and the next n entries are w.
-        - params: tuple of parameter arrays:
-            (Cl, rho_f, rho_s, u_star, r, mu, g)
-            each of shape (n_particles,)
-        
-        Returns:
-        - dydt_flat: flattened derivative array of the same length.
-        """
-        # Determine the number of particles.
-        n = y_flat.size // 2
-        # Reshape the state: first row is z, second is w.
-        y = y_flat.reshape((2, n))
-        z = y[0, :]   # particle positions
-        w = y[1, :]   # particle velocities
-        
-        # Unpack parameter arrays.
-        Cl, rho_f, rho_s, u_star, r, mu, g = params
-        
-        # Prevent division by zero: if z == 0, substitute a small value.
-        z_fixed = np.where(z == 0, 1e-8, z)
-        
-        # Compute the force terms:
-        # Lift force term.
-        lift_term = (0.5 * 3 * Cl * rho_f / (4 * r * rho_s)) * (u_star**2 * (np.log(2))**2) / (z_fixed**2)
-        # Gravity/buoyancy term.
-        gravity_term = g * (1 - rho_f / rho_s)
-        # Drag force term.
-        drag_term = (9 * mu / (2 * r**2 * rho_s)) * w
-        
-        # Compute derivatives.
-        dw_dt = lift_term - gravity_term - drag_term
-        dz_dt = w  # time derivative of z is the velocity w
-        
-        # Stack derivatives into a 2 x n array and flatten it.
-        dydt = np.vstack((dz_dt, dw_dt))
-        return dydt.flatten()
-
-    def calc_resuspension_depth(self, bottom_stress, resuspending):
-        """
-        Compute the resuspension depth (i.e. the final particle z position) using a vectorized
-        ODE integration for all active particles (where resuspending is True). The integration
-        is performed in one batch call to solve_ivp.
-        
-        For inactive particles (where resuspending is False), the output is set to NaN.
-        """
-        gravity = 9.81
-
-        # Extract environmental parameters for active particles.
-        temp = self.environment['sea_water_temperature'][resuspending]
-        sal = self.environment['sea_water_salinity'][resuspending]
-        rho_f = self.sea_water_density(temp, sal)
-
-        C_l = self.elements.C_l[resuspending]
-        rho_s = self.elements.rho_s[resuspending]
-        bot_stress = bottom_stress[resuspending]
-        
-        u_star = np.sqrt(bot_stress / rho_f)
-        r = self.elements.grain_diameter[resuspending] / 2
-        mu = self.elements.viscosity_molecular[resuspending]
-
-        # Initial conditions for the ODE.
-        z0_offset = 1e-8
-        z0_base = 1e-3  # roughness height
-        z0_initial = z0_base + z0_offset
-        n_active = np.count_nonzero(resuspending)
-        
-        # Build initial condition arrays for active particles.
-        z0_array = np.full(n_active, z0_initial)
-        w0_array = np.zeros(n_active)
-        
-        # Arrange the state as a 2 x n_active array and flatten it.
-        y0 = np.vstack((z0_array, w0_array)).flatten()
-        
-        # Integration settings.
-        npts = 100
-        t_end = 120  # integration time in seconds
-        t_span = (0, t_end)
-        t_eval = np.linspace(t_span[0], t_span[1], npts)
-        
-        # Pack parameters for all active particles into arrays.
-        # Each parameter array should have shape (n_active,).
-        params = (C_l, rho_f, rho_s, u_star, r, mu, np.full(n_active, gravity))
-        
-        # Solve the ODE system for all active particles in one call.
-        sol = solve_ivp(
-            fun=lambda t, y: self.particle_motion_vectorized(t, y, params),
-            t_span=t_span, y0=y0, t_eval=t_eval, method='BDF',
-            rtol=1e-6, atol=1e-8    )
-        
-        if not sol.success:
-            raise RuntimeError("ODE integration failed: " + sol.message)
-        
-        # The final state is given by sol.y[:, -1] with shape (2*n_active,).
-        # Reshape it into a 2 x n_active array.
-        final_state = sol.y[:, -1].reshape((2, n_active))
-        z_final = final_state[0, :]  # Extract the final z positions for all active particles.
-        
-        return z_final
 
     def calc_upward_resuspension_velocity(self, bottom_stress, resuspending):
         # Calculate the upwards velocity to give particle getting resuspended.
