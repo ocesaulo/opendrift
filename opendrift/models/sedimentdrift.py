@@ -734,141 +734,494 @@ class SedimentDrift(OceanDrift):
             logger.debug('Settling %s elements at seafloor' % np.sum(settling))
             self.elements.moving[settling] = 0
             self.elements.settled[settling] = 1
+            # Freshly deposited: restart the consolidation clock so the cohesive
+            # tau_crit begins from its as-deposited (phi0) value.
+            self.elements.time_since_settled[settling] = 0.0
+            #  self.get_distance_cell_center_above(settling)  # no longer needed here
+
+    def _critical_shear_stress(self, idxs):
+        """Resuspension threshold tau_crit [Pa] for the masked elements (Update 1).
+
+        Returned as a full-size array. The threshold is a function of each
+        element's *innate* properties (grain size/density, sediment class, floc
+        fractal state) and the *ambient fluid* (density from local T/S, molecular
+        viscosity) -- never of the bed shear stress, which is computed separately.
+
+        Modes (config 'vertical_mixing:tau_crit_mode'):
+          'constant' - legacy prescribed per-element tau_crit (back-compat default).
+          'shields'  - Soulsby-Whitehouse Shields for all elements.
+          'cohesive' - fractal floc strength for all elements.
+          'auto'     - per element by sed_class (0 -> shields, 1 -> floc); elements
+                       left at sed_class=0 with grain size below
+                       'cohesive_size_cutoff' are treated as cohesive.
+          'mixed'    - bed-composition blend Pc(bed_mud_fraction) of shields & floc.
+        """
+        tau = self.elements.tau_crit.astype(float).copy()  # constant / fallback
+        mode = self.get_config('vertical_mixing:tau_crit_mode')
+        if mode == 'constant':
+            return tau
+
+        fidx = np.where(idxs)[0]
+        if fidx.size == 0:
+            return tau
+
+        # Ambient fluid on the subset (same provenance as the SG2000 bed stress).
+        temp = self.environment['sea_water_temperature'][fidx]
+        sal = self.environment['sea_water_salinity'][fidx]
+        rho_f = np.broadcast_to(
+            np.asarray(self.sea_water_density(temp, sal), dtype=float),
+            (fidx.size,)).astype(float)
+        nu_dyn = self.get_config('environment:molecular_viscosity')  # kg/m/s
+
+        # Element (innate) properties on the subset.
+        d = self.elements.grain_diameter[fidx].astype(float)
+        rho_s = self.elements.rho_s[fidx].astype(float)
+
+        # Non-cohesive (Shields) threshold.
+        tau_nc = floc_strength.tau_crit_shields(d, rho_s, rho_f, nu_dyn)
+
+        # Cohesive (fractal floc) threshold, with consolidation growth of phi.
+        Df = self.elements.fractal_dim[fidx].astype(float)
+        phi0 = self.elements.phi0[fidx].astype(float)
+        t_settled = self.elements.time_since_settled[fidx].astype(float)
+        phi = floc_strength.consolidate_phi(
+            phi0, t_settled,
+            self.get_config('vertical_mixing:consolidation_timescale'),
+            self.get_config('vertical_mixing:consolidated_solids_fraction'))
+        tau_coh = floc_strength.tau_crit_floc(
+            phi, Df, d, rho_s, rho_f,
+            c_str=self.get_config('vertical_mixing:cohesive_strength_coeff'))
+
+        if mode == 'shields':
+            tau[fidx] = tau_nc
+        elif mode == 'cohesive':
+            tau[fidx] = tau_coh
+        elif mode == 'auto':
+            cutoff = self.get_config('vertical_mixing:cohesive_size_cutoff')
+            is_cohesive = (self.elements.sed_class[fidx] == 1) | (d < cutoff)
+            tau[fidx] = np.where(is_cohesive, tau_coh, tau_nc)
+        elif mode == 'mixed':
+            fmud = self.get_config('vertical_mixing:bed_mud_fraction')
+            lo = self.get_config('vertical_mixing:mud_fraction_lower')
+            hi = self.get_config('vertical_mixing:mud_fraction_upper')
+            Pc = np.clip((fmud - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+            tau[fidx] = (1.0 - Pc) * tau_nc + Pc * tau_coh
+
+        return tau
 
     def resuspension(self):
         """Resuspending elements when critical shear stress is exceed"""
-        threshold = self.elements.tau_crit  # tau_crit should become a function of the element and environment
+        ## Old resuspension condition
+        # threshold = self.get_config('vertical_mixing:resuspension_threshold')
+        # resuspending = np.logical_and(self.current_speed() > threshold, self.elements.moving==0)
 
         settled = np.logical_and(self.elements.moving == 0, self.elements.settled == 1)
         if np.sum(settled) > 0:
-            turnoff = self.get_config('vertical_mixing:debug_disable_bottom_stress')
-            bottom_stress = self.calc_bottom_stress(settled, turnoff=turnoff)
+            # Advance the consolidation clock for elements resting on the bed.
+            # (Used by the cohesive branch of the dynamic tau_crit closure; a no-op
+            # for tau_crit_mode='constant'/'shields'.)
+            self.elements.time_since_settled[settled] = (
+                self.elements.time_since_settled[settled] + self.time_step.total_seconds())
+            # Dynamic threshold: a function of each element's properties and the
+            # ambient fluid (Update 1). 'constant' mode returns the prescribed
+            # per-element tau_crit, i.e. the legacy behaviour.
+            threshold = self._critical_shear_stress(settled)
+            bottom_stress = self.calc_bottom_stress(settled)
             resuspending = np.logical_and(bottom_stress > threshold, settled)
         else:
             return
+            #  resuspending = settled
         
         if np.sum(resuspending) > 0:
             # Keep track of how many times particle has been resuspended
             self.elements.times_resuspended[resuspending] = self.elements.times_resuspended[resuspending] + 1
             # Allow moving again
             self.elements.moving[resuspending] = 1
-            # Calculate the particle z position from height above bottom following particle motion scheme.
-            height_above_bottom = self.calc_resuspension_depth(bottom_stress, resuspending)
+            # Since not at bottom anymore, set distance to nearest cell center above to 99999
+            # self.elements.dz_bot[resuspending] = 99999.0  # no longer needed here
+            # Give particle upwards velocity
+            # self.elements.terminal_velocity[resuspending] = self.calc_upward_resuspension_velocity(bottom_stress, resuspending)
+            # Keep track of number of time steps particle has been in resuspension for (however, it is always 1 dt)
+            # self.elements.counter[resuspending] = 1  # should be improved - a nominal dt is too long for being resuspended, maybe as a var called in_resuspension that sends these elements to a small loop like v-mix
+            # Calculate the particle z position from height above bottom following
+            # the configured resuspension-height scheme (Update 2).
+            height_above_bottom = self.calc_resuspension_height(bottom_stress, resuspending)
+            # print(np.max(height_above_bottom))
             new_z = self.elements.z[resuspending] + height_above_bottom
             new_z[new_z > 0] = 0
             # Update the z position of the particle
             self.elements.z[resuspending] = new_z
             # Switch particles that are resuspending out of settled mode
             self.elements.settled[resuspending] = 0
+            # Reset the consolidation clock: a resuspended element re-deposits fresh.
+            self.elements.time_since_settled[resuspending] = 0.0
             # keep track of the latest resuspension height:
             self.elements.latest_resuspension_height[resuspending] = height_above_bottom
 
-    def calc_bottom_stress(self, idxs, turnoff=False):
-        """
-        Compute bottom stress for a set of particles (or grid cells) identified by the boolean mask `idxs`.
-        The returned array has the same shape as the full elements array. For indices not included in `idxs`,
-        the bottom stress is set to NaN.
-        
-        This function uses a vectorized search (via np.searchsorted) to locate the appropriate vertical
-        cell for each active particle, then computes the bottom stress with the same logic as before.
-        """
-        if turnoff:
-            if self._warned_bottom_stress_disabled is False:
-                logger.warning('Bottom stress calculation disabled by config vertical_mixing:debug_disable_bottom_stress')
-                self._warned_bottom_stress_disabled = True
-            return np.zeros(self.elements.z.shape)
+    def _near_bottom_environment(self, idxs):
+        """Vectorized extraction of the near-bed environment for the masked
+        elements `idxs`. This factors the MITgcm-grid / input logic shared by all
+        BBL schemes: a vectorized `searchsorted` locates the deepest velocity cell
+        above the local seafloor, from which the near-bed current, vertical
+        diffusivity and layer thickness `dz_bot` are read. Surface wave fields and
+        water depth are taken from `self.environment` (already computed this step,
+        so no extra reader call). Elements settled below the shallowest grid cell
+        are flagged `beached`.
 
-        # 1. Extract data only for active particles (where idxs is True)
-        floor_idx = np.where(idxs)[0]  # indices in the full array that are active
+        Returns a dict of subset-length (n_active) arrays, or None if empty.
+        """
+        floor_idx = np.where(idxs)[0]
         if floor_idx.size == 0:
-            # No active particles: return an array of zeros with the full shape.
-            return np.zeros(self.elements.z.shape)
-            
-        zs   = self.elements.z[idxs]
+            return None
+
         lons = self.elements.lon[idxs]
         lats = self.elements.lat[idxs]
         atimes = self.time
-
-        variables = ['x_sea_water_velocity', 'y_sea_water_velocity',
-                    'ocean_vertical_diffusivity', 'sea_floor_depth_below_sea_level']
-        profiles = ['x_sea_water_velocity', 'y_sea_water_velocity', 'ocean_vertical_diffusivity']
-
-        # Get environment data (both cell-centered and profile)
-        env_var, env_profs, amiss = self.env.get_environment(variables, atimes, lons, lats, zs, profiles)
-
-        # seafloor depth (convert sign so that depth is positive downward)
-        # (Note: self.environment['sea_floor_depth_below_sea_level'] is assumed to be defined over the entire domain)
+        n_active = floor_idx.size
+        dz_bot_min = 0.1
+        # Seafloor depth (negative z) is already in self.environment from this step.
         el_seafloor_depth_z = -1 * self.environment['sea_floor_depth_below_sea_level'][idxs]
 
-        # Get the vertical grid from the profile data.
-        # Here we assume that zgrid is a 1D array (e.g., shape (n_levels,)) that is monotonic.
-        zgrid = env_profs['z']  # e.g., descending (surface to seafloor)
+        variables = ['x_sea_water_velocity', 'y_sea_water_velocity',
+                     'ocean_vertical_diffusivity', 'sea_floor_depth_below_sea_level']
+        scheme = self.get_config('vertical_mixing:bbl_ref_velocity')
 
-        # 2. Initialize arrays for active particles
-        n_active = floor_idx.size
-        # For each active particle, we want to determine the local near-bottom cell.
-        # Set minimum bottom layer thickness and a critical layer thickness.
-        dz_bot_min = 0.1                # minimum allowed thickness (m)
-        crit_last_layer_thickness = 1.  # threshold for turbulent contribution
+        # ---- 'fixed_height' (A): near-bed velocity at a fixed height above the bed ----
+        if scheme == 'fixed_height':
+            h_ref = float(self.get_config('vertical_mixing:bbl_fixed_ref_height'))
+            # reference z: h_ref above the bed, but kept below the surface
+            z_ref = np.minimum(el_seafloor_depth_z + h_ref, -dz_bot_min)
+            env_var, _, _ = self.env.get_environment(
+                variables, atimes, lons, lats, z_ref, None)   # profiles=None -> single level
+            return dict(floor_idx=floor_idx, n_active=n_active,
+                        u=np.asarray(env_var['x_sea_water_velocity'], dtype=float),
+                        v=np.asarray(env_var['y_sea_water_velocity'], dtype=float),
+                        visc=np.asarray(env_var['ocean_vertical_diffusivity'], dtype=float),
+                        dz_bot=np.full(n_active, h_ref),
+                        depth=-el_seafloor_depth_z)
 
-        # 3. Find the near-bottom level for each active particle
-        #
-        # For each active particle with seafloor depth `adep` (from el_seafloor_depth_z),
-        # we need the index of the last grid cell in zgrid that is above the seafloor.
-        #
-        # The original code did:
-        #     last_indz = np.argwhere(zgrid > adep)
-        # and used last_indz[-1] if any exist; otherwise, fallback to index 0.
-        #
-        # We can do this vectorially if we assume that zgrid is monotonic. However,
-        # since np.searchsorted requires an ascending array, we invert the sign.
-        #
-        # For each active particle, we compute:
-        #    search_idx = np.searchsorted(-zgrid, -adep, side='right')
-        # If search_idx > 0 then the desired index is search_idx - 1; otherwise, we use 0.
+        # 'profile' and 'deepest_cell' both locate the deepest velocity cell above the
+        # seafloor on the reader's (static) vertical grid `zgrid`.
+        profiles = ['x_sea_water_velocity', 'y_sea_water_velocity', 'ocean_vertical_diffusivity']
+        need_profile_call = (scheme == 'profile') or (getattr(self, '_bbl_zgrid', None) is None)
+        if need_profile_call:
+            # Full-profile reader call: the original path, and also how we capture and
+            # cache the static reader z-grid on the first 'deepest_cell' step.
+            env_var, env_profs, amiss = self.env.get_environment(
+                variables, atimes, self.elements.lon[idxs], lats, self.elements.z[idxs], profiles)
+            self._bbl_zgrid = np.asarray(env_profs['z'])
+
+        zgrid = self._bbl_zgrid
         search_indices = np.searchsorted(-zgrid, -el_seafloor_depth_z, side='right')
         selected_idx = np.where(search_indices > 0, search_indices - 1, 0)
-
-        # 4. Extract near-bottom values from the profile arrays.
-        # We assume that env_profs['x_sea_water_velocity'], etc., have shape (n_levels, n_active)
-        particle_range = np.arange(n_active)
-
-        u = env_profs['x_sea_water_velocity'][selected_idx, particle_range]
-        v = env_profs['y_sea_water_velocity'][selected_idx, particle_range]
-        visc = env_profs['ocean_vertical_diffusivity'][selected_idx, particle_range]
-
-        # Compute the local layer thickness for each active particle.
         dz_bot = np.maximum(zgrid[selected_idx] - el_seafloor_depth_z, dz_bot_min)
-
-        # Log a debug message for any particle that got the fallback index.
         fallback = (search_indices == 0)
         if np.any(fallback):
             self.elements.beached[floor_idx[fallback]] = 1
 
-        # 5. Compute the bottom stress using the same formulas as before
-        r_b = 0
-        c_d = 0.0021  # drag coefficient (to be updated later for a log-wall model)
-        _2KE = u**2 + v**2  # twice the kinetic energy (ignoring vertical velocity)
-        vel_mag = np.sqrt(_2KE)
+        if scheme == 'profile':
+            particle_range = np.arange(n_active)
+            u = env_profs['x_sea_water_velocity'][selected_idx, particle_range]
+            v = env_profs['y_sea_water_velocity'][selected_idx, particle_range]
+            visc = env_profs['ocean_vertical_diffusivity'][selected_idx, particle_range]
+        else:
+            # ---- 'deepest_cell' (A'): single-level reader call at the cell depth ----
+            # zgrid[selected_idx] is the deepest velocity-cell depth above each
+            # element's seafloor; reading there (profiles=None) reproduces the
+            # 'profile' pick without interpolating the whole column.
+            z_ref = zgrid[selected_idx]
+            env_var, _, _ = self.env.get_environment(
+                variables, atimes, lons, lats, z_ref, None)
+            u = np.asarray(env_var['x_sea_water_velocity'], dtype=float)
+            v = np.asarray(env_var['y_sea_water_velocity'], dtype=float)
+            visc = np.asarray(env_var['ocean_vertical_diffusivity'], dtype=float)
 
-        # Turbulent contribution is computed only if the layer thickness is above a threshold.
-        turb_layers = dz_bot >= crit_last_layer_thickness
-        turb_contrib = np.zeros(n_active)
-        turb_contrib[turb_layers] = 2 * visc[turb_layers] / dz_bot[turb_layers] * vel_mag[turb_layers]
+        return dict(floor_idx=floor_idx, n_active=n_active,
+                    u=u, v=v, visc=visc, dz_bot=dz_bot,
+                    depth=-el_seafloor_depth_z)  # positive-down water depth [m]
 
-        # Mean-flow contribution (as in the original code)
-        mean_flow_contrib = (r_b + c_d * vel_mag) * vel_mag
-        bottom_stress_pseudo_energy_magnitude = mean_flow_contrib + turb_contrib
+    @staticmethod
+    def _wave_number(omega, h, g=9.81, n_iter=8):
+        """Linear-wave dispersion: solve omega^2 = g k tanh(k h) for k.
+        Vectorized Newton iteration from the deep-water guess."""
+        omega = np.asarray(omega, dtype=float)
+        h = np.asarray(h, dtype=float)
+        k = np.maximum(omega ** 2 / g, 1e-6)
+        for _ in range(n_iter):
+            th = np.tanh(np.minimum(k * h, 50.0))
+            f = g * k * th - omega ** 2
+            df = g * th + g * k * h * (1 - th ** 2)
+            k = np.maximum(k - f / df, 1e-8)
+        return k
 
-        # Multiply by the sea water density.
-        computed_bottom_stress = self.sea_water_density() * bottom_stress_pseudo_energy_magnitude
+    def _bottom_stress_sg2000(self, env):
+        """Styles & Glenn (2000) bed shear stress [Pa] for the near-bed `env`.
 
-        # 6. Place the computed values back into an array of full size
+        The bed stress is computed by one of three routes per element, chosen by
+        whether the near-bed reference velocity height (`dz_bot`, distance from the
+        seafloor to the centre of the deepest velocity cell) lies within a
+        resolvable bottom boundary layer:
+
+          1. dz_bot > `vertical_mixing:bbl_max_ref_height`  -> the reference current
+             sits ABOVE the log/BBL layer (coarse deep-ocean grid, e.g. a ~50 m thick
+             near-bottom cell). The log-law / SG2000 inversion is not valid there, so
+             the stress reverts to the MITgcm-style quadratic drag tau = rho*c_d*|u|^2
+             (same rationale and c_d as the legacy scheme / MITgcm bottom BC).
+          2. dz_bot <= cap and no waves at the bed -> current-only law-of-the-wall.
+          3. dz_bot <= cap and waves reach the bed (Ub>1mm/s) -> full SG2000 solve.
+
+        So SG2000/log-law is applied only where the grid resolves the BBL (typically
+        the shelf), while deep coarse-grid cells use the drag law. Fully vectorized
+        (no per-element Python loops); SG2000 internals are cgs.
+        """
+        g = 9.81
+        kappa = 0.4
+        fidx = env['floor_idx']
+        n = env['n_active']
+        bbl_max_ref_height = self.get_config('vertical_mixing:bbl_max_ref_height')
+        c_d = self.get_config('vertical_mixing:bottom_drag_coefficient')
+
+        Ur = np.maximum(np.sqrt(env['u'] ** 2 + env['v'] ** 2), 1e-6)  # m/s
+        zr = np.maximum(env['dz_bot'], 1e-3)                           # m
+        depth = np.maximum(env['depth'], 1e-3)                         # m, positive down
+
+        # Bed/fluid properties (environment + config only) — the bed shear stress must
+        # NOT depend on the individual drifting particle. rho_f from the local T/S;
+        # bed median grain size, bed sediment density and molecular viscosity from config.
+        temp = self.environment['sea_water_temperature'][fidx]
+        sal = self.environment['sea_water_salinity'][fidx]
+        rho_f = np.broadcast_to(
+            np.asarray(self.sea_water_density(temp, sal), dtype=float), (n,)).astype(float)
+        d_med = np.full(n, self.get_config('vertical_mixing:bed_median_grain_size'))  # m
+        rho_bed = self.get_config('vertical_mixing:bed_sediment_density')             # kg/m3
+        nu_dyn = self.get_config('environment:molecular_viscosity')                   # kg/m/s
+
+        # wave forcing (surface fields, from self.environment)
+        Hs = np.asarray(self.environment['sea_surface_wave_significant_height'])[fidx].astype(float)
+        Tp = np.asarray(self.environment[
+            'sea_surface_wave_period_at_variance_spectral_density_maximum'])[fidx].astype(float)
+
+        # near-bed wave orbital velocity / excursion from linear-wave theory.
+        # In deep water (e.g. the San Pedro basin) waves do not reach the bed and Ub->0;
+        # those cells fall back to the current-only law-of-the-wall. When there is no
+        # wave forcing at all (Hs==0, the typical MITgcm-only run) the whole dispersion
+        # computation is skipped so the cost matches the current-only legacy estimate.
+        a_orb = np.zeros(n)
+        Ub_w = np.zeros(n)
+        if np.any((Hs > 1e-4) & (Tp > 1e-2)):
+            Tp_ok = Tp > 1e-2
+            omega = np.where(Tp_ok, 2.0 * np.pi / np.where(Tp_ok, Tp, 1.0), 0.0)
+            kwave = self._wave_number(omega, depth, g)
+            sinhkh = np.maximum(np.sinh(np.minimum(kwave * depth, 50.0)), 1e-6)
+            a_orb = np.where(Tp_ok & (Hs > 0), (Hs / 2.0) / sinhkh, 0.0)  # excursion amp [m]
+            Ub_w = a_orb * omega                                          # orbital vel [m/s]
+        wave_active = (Ub_w > 1e-3)   # >~1 mm/s near-bed orbital velocity
+
+        # Is the reference velocity within a resolvable bottom boundary layer?
+        bbl_valid = zr <= bbl_max_ref_height
+
+        ustarcw = np.zeros(n)
+        ustarc = np.zeros(n)
+        ustarwm = np.zeros(n)
+
+        # ---- (1) reference height above the BBL -> MITgcm quadratic drag ----
+        # tau = rho*c_d*|u|^2  i.e. u* = sqrt(c_d)*|u| (legacy / MITgcm bottom BC).
+        drag = ~bbl_valid
+        if np.any(drag):
+            us = np.sqrt(c_d) * Ur[drag]
+            ustarc[drag] = us
+            ustarcw[drag] = us
+
+        # ---- (2) current-only law-of-the-wall where the BBL is resolved ----
+        loglaw = bbl_valid & (~wave_active)
+        if np.any(loglaw):
+            kbr_def_m = 0.03  # 3 cm default bed roughness (SG2000 no-motion limit)
+            z0 = (d_med[loglaw] + kbr_def_m) / 30.0
+            ratio = np.maximum(zr[loglaw] / np.maximum(z0, 1e-9), 1.0001)
+            us = kappa * Ur[loglaw] / np.log(ratio)
+            ustarc[loglaw] = us
+            ustarcw[loglaw] = us
+
+        # ---- (3) full SG2000 where the BBL is resolved and waves reach the bed ----
+        sg = bbl_valid & wave_active
+        if np.any(sg):
+            wa = sg
+            # wave-current angle from stokes-drift vs near-bed current direction
+            stx = np.asarray(self.environment[
+                'sea_surface_wave_stokes_drift_x_velocity'])[fidx][wa].astype(float)
+            sty = np.asarray(self.environment[
+                'sea_surface_wave_stokes_drift_y_velocity'])[fidx][wa].astype(float)
+            cur_dir = np.arctan2(env['v'][wa], env['u'][wa])
+            wav_dir = np.arctan2(sty, stx)
+            dtheta = np.arctan2(np.sin(wav_dir - cur_dir), np.cos(wav_dir - cur_dir))
+            # undefined direction (no stokes info) -> assume aligned
+            dtheta = np.where(np.hypot(stx, sty) < 1e-9, 0.0, dtheta)
+            deg = np.degrees(np.abs(dtheta))
+
+            # bed/fluid properties on the wave-active subset (config-based, per-cell rho_f)
+            s_wa = rho_bed / rho_f[wa]
+            nu_wa = nu_dyn / rho_f[wa]
+
+            out = sg2000_solve(
+                Ub=Ub_w[wa] * 100.0, Ab=a_orb[wa] * 100.0, Ur=Ur[wa] * 100.0,
+                zr=zr[wa] * 100.0, deg=deg,
+                d_median=d_med[wa] * 100.0, s=s_wa,
+                nu=nu_wa * 1e4, g=g * 100.0)
+            ustarcw[wa] = out['ustarcw'] / 100.0   # cm/s -> m/s
+            ustarc[wa] = out['ustarc'] / 100.0
+            ustarwm[wa] = out['ustarwm'] / 100.0
+
+        which = self.get_config('vertical_mixing:bbl_stress')
+        ustar = {'combined': ustarcw, 'mean': ustarc, 'wave': ustarwm}[which]
+        return rho_f * ustar ** 2   # Pa
+
+    def calc_bottom_stress(self, idxs, turnoff=False):
+        """Bed shear stress [Pa] for the masked elements, returned in a full-size
+        array (zero outside `idxs`).
+
+        Scheme selected by config 'vertical_mixing:bbl_scheme':
+          'sg2000' - Styles & Glenn (2000) combined wave-current BBL (current-only
+                     law-of-the-wall where there are no waves). See
+                     `_bottom_stress_sg2000`.
+          'legacy' - the previous c_d drag + diffusivity estimate.
+        Both share the vectorized near-bed/grid extraction in
+        `_near_bottom_environment`.
+        """
+        if turnoff:
+            return np.zeros(self.elements.z.shape)
+
+        env = self._near_bottom_environment(idxs)
+        if env is None:
+            return np.zeros(self.elements.z.shape)
+
+        scheme = self.get_config('vertical_mixing:bbl_scheme')
+        if scheme == 'legacy':
+            r_b = 0
+            c_d = 0.0021
+            crit_last_layer_thickness = 1.
+            vel_mag = np.sqrt(env['u'] ** 2 + env['v'] ** 2)
+            turb_contrib = np.zeros(env['n_active'])
+            turb_layers = env['dz_bot'] >= crit_last_layer_thickness
+            turb_contrib[turb_layers] = (2 * env['visc'][turb_layers]
+                                         / env['dz_bot'][turb_layers] * vel_mag[turb_layers])
+            mean_flow_contrib = (r_b + c_d * vel_mag) * vel_mag
+            computed = self.sea_water_density() * (mean_flow_contrib + turb_contrib)
+        else:
+            computed = self._bottom_stress_sg2000(env)
+
         full_bottom_stress = np.zeros(self.elements.z.shape)
-        # For the indices in the full array corresponding to active particles, insert the computed values.
-        full_bottom_stress[floor_idx] = computed_bottom_stress
-
+        full_bottom_stress[env['floor_idx']] = computed
         return full_bottom_stress
+
+    # def calc_bottom_stress(self, idxs):
+    #     """
+    #     Compute bottom stress for a set of particles (or grid cells) identified by the boolean mask `idxs`.
+    #     The returned array has the same shape as the full elements array. For indices not included in `idxs`,
+    #     the bottom stress is set to NaN.
+        
+    #     This function uses a vectorized search (via np.searchsorted) to locate the appropriate vertical
+    #     cell for each active particle, then computes the bottom stress with the same logic as before.
+    #     """
+    #     # 1. Extract data only for active particles (where idxs is True)
+    #     floor_idx = np.where(idxs)[0]  # indices in the full array that are active
+    #     if floor_idx.size == 0:
+    #         # No active particles: return an array of zeros with the full shape.
+    #         return np.zeros(self.elements.z.shape)
+            
+    #     zs   = self.elements.z[idxs]
+    #     lons = self.elements.lon[idxs]
+    #     lats = self.elements.lat[idxs]
+    #     atimes = self.time
+
+    #     variables = ['x_sea_water_velocity', 'y_sea_water_velocity',
+    #                 'ocean_vertical_diffusivity', 'sea_floor_depth_below_sea_level']
+    #     profiles = ['x_sea_water_velocity', 'y_sea_water_velocity', 'ocean_vertical_diffusivity']
+
+    #     # Get environment data (both cell-centered and profile)
+    #     env_var, env_profs, amiss = self.env.get_environment(variables, atimes, lons, lats, zs, profiles)
+
+    #     # seafloor depth (convert sign so that depth is positive downward)
+    #     # (Note: self.environment['sea_floor_depth_below_sea_level'] is assumed to be defined over the entire domain)
+    #     el_seafloor_depth_z = -1 * self.environment['sea_floor_depth_below_sea_level'][idxs]
+
+    #     # Get the vertical grid from the profile data.
+    #     # Here we assume that zgrid is a 1D array (e.g., shape (n_levels,)) that is monotonic.
+    #     zgrid = env_profs['z']  # e.g., descending (surface to seafloor)
+
+    #     # 2. Initialize arrays for active particles
+    #     n_active = floor_idx.size
+    #     # For each active particle, we want to determine the local near-bottom cell.
+    #     # Set minimum bottom layer thickness and a critical layer thickness.
+    #     dz_bot_min = 0.1                # minimum allowed thickness (m)
+    #     crit_last_layer_thickness = 1.  # threshold for turbulent contribution
+
+    #     # Allocate arrays of length n_active for near-bottom quantities.
+    #     # (They will be filled with vectorized operations below.)
+    #     u_bot    = np.empty(n_active)
+    #     v_bot    = np.empty(n_active)
+    #     visc_bot = np.empty(n_active)
+    #     dz_bot   = np.full(n_active, dz_bot_min)
+    #     turb_contrib = np.zeros(n_active)
+
+    #     # 3. Find the near-bottom level for each active particle
+    #     #
+    #     # For each active particle with seafloor depth `adep` (from el_seafloor_depth_z),
+    #     # we need the index of the last grid cell in zgrid that is above the seafloor.
+    #     #
+    #     # The original code did:
+    #     #     last_indz = np.argwhere(zgrid > adep)
+    #     # and used last_indz[-1] if any exist; otherwise, fallback to index 0.
+    #     #
+    #     # We can do this vectorially if we assume that zgrid is monotonic. However,
+    #     # since np.searchsorted requires an ascending array, we invert the sign.
+    #     #
+    #     # For each active particle, we compute:
+    #     #    search_idx = np.searchsorted(-zgrid, -adep, side='right')
+    #     # If search_idx > 0 then the desired index is search_idx - 1; otherwise, we use 0.
+    #     search_indices = np.searchsorted(-zgrid, -el_seafloor_depth_z, side='right')
+    #     selected_idx = np.where(search_indices > 0, search_indices - 1, 0)
+
+    #     # 4. Extract near-bottom values from the profile arrays.
+    #     # We assume that env_profs['x_sea_water_velocity'], etc., have shape (n_levels, n_active)
+    #     particle_range = np.arange(n_active)
+    #     u_bot    = env_profs['x_sea_water_velocity'][selected_idx, particle_range]
+    #     v_bot    = env_profs['y_sea_water_velocity'][selected_idx, particle_range]
+    #     visc_bot = env_profs['ocean_vertical_diffusivity'][selected_idx, particle_range]
+
+    #     # Compute the local layer thickness for each active particle.
+    #     dz_bot = zgrid[selected_idx] - el_seafloor_depth_z
+
+    #     # Log a debug message for any particle that got the fallback index.
+    #     fallback = (search_indices == 0)
+    #     if np.any(fallback):
+    #         for i in np.where(fallback)[0]:
+    #             self.elements.beached[floor_idx[i]] = 1
+    #             logger.debug('Element %s settled at seafloor shallower than shallowest grid cell' %
+    #                         self.elements.ID[floor_idx[i]])
+
+    #     # 5. Compute the bottom stress using the same formulas as before
+    #     r_b = 0
+    #     c_d = 0.0021  # drag coefficient (to be updated later for a log-wall model)
+    #     _2KE = u_bot**2 + v_bot**2  # twice the kinetic energy (ignoring vertical velocity)
+    #     vel_mag = np.sqrt(_2KE)
+
+    #     # Turbulent contribution is computed only if the layer thickness is above a threshold.
+    #     turb_layers = dz_bot >= crit_last_layer_thickness
+    #     turb_contrib[turb_layers] = 2 * visc_bot[turb_layers] / dz_bot[turb_layers] * vel_mag[turb_layers]
+
+    #     # Mean-flow contribution (as in the original code)
+    #     mean_flow_contrib = (r_b + c_d * np.sqrt(_2KE)) * vel_mag
+    #     bottom_stress_pseudo_energy_magnitude = mean_flow_contrib + turb_contrib
+
+    #     # Multiply by the sea water density.
+    #     computed_bottom_stress = self.sea_water_density() * bottom_stress_pseudo_energy_magnitude
+
+    #     # 6. Place the computed values back into an array of full size
+    #     full_bottom_stress = np.zeros(self.elements.z.shape)
+    #     # For the indices in the full array corresponding to active particles, insert the computed values.
+    #     full_bottom_stress[floor_idx] = computed_bottom_stress
+
+    #     return full_bottom_stress
 
     def find_nearest(self, array, value):
         """
