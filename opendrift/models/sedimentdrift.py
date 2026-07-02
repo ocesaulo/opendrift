@@ -250,15 +250,366 @@ class SedimentDrift(OceanDrift):
                 'level': CONFIG_LEVEL_ESSENTIAL
             }})
 
+        # ----- Settling (terminal) velocity closure -----
+        # How each element's terminal_velocity is obtained (see models/settling.py):
+        #   'prescribed' - LEGACY default: terminal_velocity is left as seeded
+        #                  (the use_stokes/empirical path in SedimentElement.move_elements);
+        #                  update_terminal_velocity() is a no-op. Reproduces old runs.
+        #   'stokes'     - model-side Stokes law using the real local fluid density.
+        #   'dietrich'   - Dietrich (1982) drag (sub-spherical grain).
+        #   'bb16'       - Bagheri & Bonadonna (2016), uses corey_shape_factor.
+        #   'maggi' / 'maggi_permeable' - Maggi (2013) fractal aggregate, uses d0,
+        #                  fractal_dim.
         self._add_config({
-            'vertical_mixing:debug_disable_bottom_stress': {
+            'vertical_mixing:settling_model': {
+                'type': 'enum',
+                'enum': ['prescribed', 'stokes', 'dietrich', 'bb16',
+                         'maggi', 'maggi_permeable'],
+                'default': 'prescribed',
+                'description':
+                'Closure for the per-element settling (terminal) velocity. '
+                "Default 'prescribed' keeps the legacy seeded value; the other "
+                'modes compute it from grain size/density/shape and the ambient '
+                'fluid via models/settling.py.',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+        # When False (default) a non-'prescribed' settling velocity is computed once,
+        # at each element's first active step, and then held fixed (cheap, seed-time
+        # static). When True it is recomputed every step from the local T/S-derived
+        # fluid density and viscosity -> dynamic terminal velocity, no other change.
+        self._add_config({
+            'vertical_mixing:settling_dynamic': {
                 'type': 'bool',
                 'default': False,
                 'description':
-                'Disable bottom-stress forcing in resuspension (debug only, non-physical).',
+                'Recompute the settling velocity every step from the local fluid '
+                'properties (dynamic) instead of once at first activation (static).',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+
+
+        # Bottom boundary layer scheme used to compute the bed shear stress that
+        # drives resuspension. 'sg2000' is the Styles & Glenn (2000) combined
+        # wave-current model (reduces to a current-only log-law where no waves);
+        # 'legacy' is the old c_d drag + diffusivity estimate.
+        self._add_config({
+            'vertical_mixing:bbl_scheme': {
+                'type': 'enum',
+                'enum': ['sg2000', 'legacy'],
+                'default': 'sg2000',
+                'description':
+                'Bottom boundary layer model for the bed shear stress driving resuspension.',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+
+        # Which SG2000 shear stress drives resuspension: 'combined' (peak
+        # wave-current, tau=rho*ustarcw^2, recommended for initiation of motion),
+        # 'mean' (time-mean current, ustarc), or 'wave' (max wave, ustarwm).
+        self._add_config({
+            'vertical_mixing:bbl_stress': {
+                'type': 'enum',
+                'enum': ['combined', 'mean', 'wave'],
+                'default': 'combined',
+                'description':
+                'Which SG2000 shear stress is compared against tau_crit for resuspension.',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+
+        # SG2000/log-law validity guard: the near-bed reference velocity must lie
+        # within a resolvable bottom boundary layer. Where the deepest velocity cell
+        # centre sits higher than this above the bed (coarse deep-ocean grid, e.g. a
+        # ~50 m near-bottom layer), the log-law is invalid and the stress reverts to
+        # the MITgcm-style quadratic drag (see _bottom_stress_sg2000).
+        self._add_config({
+            'vertical_mixing:bbl_max_ref_height': {
+                'type': 'float',
+                'default': 10.0,
+                'min': 0.1,
+                'max': 1000.0,
+                'units': 'm',
+                'description':
+                'Max height of the near-bed reference velocity for which the BBL '
+                'log-law / SG2000 is applied; above it the bed stress uses a '
+                'quadratic drag (MITgcm bottom BC).',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+        self._add_config({
+            'vertical_mixing:bottom_drag_coefficient': {
+                'type': 'float',
+                'default': 0.0021,
+                'min': 0,
+                'max': 0.1,
+                'units': '1',
+                'description':
+                'Quadratic bottom drag coefficient c_d used where the BBL is not '
+                'grid-resolved (and by the legacy scheme).',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+
+        # Bed/fluid properties that set the SG2000 bottom stress. These describe the
+        # ambient seabed and water, NOT the drifting tracer: the bed shear stress is a
+        # property of the flow + bed, so it must not depend on an individual particle's
+        # grain size or density. (Per-particle grain_diameter/rho_s/tau_crit still drive
+        # that particle's own settling, resuspension height, and resuspension threshold.)
+        self._add_config({
+            'vertical_mixing:bed_median_grain_size': {
+                'type': 'float',
+                'default': 31e-6,
+                'min': 1e-7,
+                'max': 1e-2,
+                'units': 'm',
+                'description':
+                'Median grain size of the ambient seabed, used for SG2000 skin '
+                'friction, ripple geometry and hydraulic roughness.',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+        self._add_config({
+            'vertical_mixing:bed_sediment_density': {
+                'type': 'float',
+                'default': 2650.0,
+                'min': 1000.0,
+                'max': 5000.0,
+                'units': 'kgm-3',
+                'description':
+                'Density of the ambient seabed sediment, used for the SG2000 density '
+                'ratio s in skin friction / ripple roughness.',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+
+        # How the near-bed REFERENCE velocity (input to every BBL stress scheme) is
+        # obtained for settled elements. The reader call to get it dominates runtime
+        # at large settled counts, so this trades cost vs faithfulness:
+        #   'profile'      - interpolate the full vertical profile, then pick the
+        #                    deepest velocity cell above the seafloor (original; exact
+        #                    but O(n_settled x n_levels) interpolation every step).
+        #   'deepest_cell' - same deepest-cell value, but obtained with a SINGLE-level
+        #                    reader call at the (cached, static) cell depth -> O(n_settled),
+        #                    ~n_levels x cheaper, reproduces 'profile' to interpolation
+        #                    round-off. Recommended for large-domain settling runs.
+        #   'fixed_height' - near-bed velocity at a FIXED height above the bed
+        #                    (bbl_fixed_ref_height); single-level call. Cheapest and
+        #                    uses a consistent reference height, but changes the value
+        #                    vs 'profile' (different reference height per cell).
+        self._add_config({
+            'vertical_mixing:bbl_ref_velocity': {
+                'type': 'enum',
+                'enum': ['profile', 'deepest_cell', 'fixed_height'],
+                # Default 'deepest_cell': bit-identical to 'profile' (validated max|Δ|=0
+                # Pa in bed stress) but a single-level reader call instead of a full
+                # vertical-profile interpolation -- ~23% cheaper resuspension / bottom-
+                # stress per step at large settled counts (see BOTTLENECK_LARGEDOMAIN.md
+                # deepest_cell FOLLOW-UP). Set 'profile' to restore the exact original
+                # interpolation path.
+                'default': 'deepest_cell',
+                'description':
+                'How the near-bed reference velocity for the BBL stress is obtained.',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+        self._add_config({
+            'vertical_mixing:bbl_fixed_ref_height': {
+                'type': 'float',
+                'default': 5.0,
+                'min': 0.1,
+                'max': 100.0,
+                'units': 'm',
+                'description':
+                "Height above the bed at which the near-bed reference velocity is "
+                "read when bbl_ref_velocity == 'fixed_height'.",
                 'level': CONFIG_LEVEL_ADVANCED
             }})
 
+        # ----- Dynamic critical shear stress (resuspension threshold) -----
+        # How tau_crit is obtained per element (Update 1). Production default 'auto'
+        # routes by sed_class; 'constant' keeps the legacy prescribed per-element
+        # tau_crit (set this to reproduce old runs). The dynamic modes derive
+        # tau_crit from particle properties + the ambient fluid:
+        #   'shields'  - all elements: Soulsby-Whitehouse Shields from grain d, rho_s.
+        #   'cohesive' - all elements: fractal floc strength (phi, Df, d_floc, rho_s).
+        #   'auto'     - per element by sed_class (0->shields, 1->cohesive floc).
+        #   'mixed'    - bed-composition blend Pc(bed_mud_fraction) of shields & floc.
+        self._add_config({
+            'vertical_mixing:tau_crit_mode': {
+                'type': 'enum',
+                'enum': ['constant', 'shields', 'cohesive', 'auto', 'mixed'],
+                'default': 'auto',
+                'description':
+                'How the resuspension threshold tau_crit is computed per element. '
+                "Production default 'auto' routes each element by sed_class "
+                "(0->Shields, 1->cohesive floc strength); use 'constant' to "
+                'reproduce legacy runs with a prescribed per-element tau_crit.',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+        self._add_config({
+            'vertical_mixing:cohesive_size_cutoff': {
+                'type': 'float',
+                'default': 63e-6,
+                'min': 0,
+                'max': 1e-3,
+                'units': 'm',
+                'description':
+                'Grain size below which an element left at sed_class=0 is treated '
+                'as cohesive (sed_class=1) by the dynamic tau_crit closure.',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+        self._add_config({
+            'vertical_mixing:cohesive_strength_coeff': {
+                'type': 'float',
+                'default': 100.0,
+                'min': 0,
+                'max': 1e6,
+                'units': '1',
+                'description':
+                'Calibration coefficient c_str in the fractal cohesive strength '
+                'tau = c_str*g*(rho_s-rho_f)*d_floc*phi^(2/(3-Df)). The buoyant '
+                'stress scale g*(rho_s-rho_f)*d_floc is tiny for fine flocs, so '
+                'c_str is O(100); the default gives ~0.04 Pa for the default fresh '
+                'floc (d=4um, phi0=0.1, Df=2), comparable to the legacy tau_crit. '
+                'Calibrate to your seeded floc properties / measured erosion threshold.',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+        self._add_config({
+            'vertical_mixing:consolidation_timescale': {
+                'type': 'float',
+                'default': 86400.0,
+                'min': 1.0,
+                'max': 1e9,
+                'units': 's',
+                'description':
+                'Timescale over which a settled cohesive deposit consolidates '
+                '(phi grows phi0 -> consolidated_solids_fraction), raising tau_crit.',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+        self._add_config({
+            'vertical_mixing:consolidated_solids_fraction': {
+                'type': 'float',
+                'default': 0.4,
+                'min': 0,
+                'max': 1,
+                'units': '1',
+                'description':
+                'Packed solids volume fraction phi_max approached by a fully '
+                'consolidated cohesive deposit.',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+        self._add_config({
+            'vertical_mixing:mud_fraction_lower': {
+                'type': 'float',
+                'default': 0.05,
+                'min': 0,
+                'max': 1,
+                'units': '1',
+                'description':
+                'Bed mud fraction at which cohesive behaviour begins (Pc=0 below) '
+                'for the mixed tau_crit mode.',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+        self._add_config({
+            'vertical_mixing:mud_fraction_upper': {
+                'type': 'float',
+                'default': 0.35,
+                'min': 0,
+                'max': 1,
+                'units': '1',
+                'description':
+                'Bed mud fraction at which behaviour is fully cohesive (Pc=1 above) '
+                'for the mixed tau_crit mode (Yao 2022 ~0.35 silt; Jacobs 2011 clay).',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+        self._add_config({
+            'vertical_mixing:bed_mud_fraction': {
+                'type': 'float',
+                'default': 0.5,
+                'min': 0,
+                'max': 1,
+                'units': '1',
+                'description':
+                'Mud (cohesive) fraction of the ambient seabed, used by the mixed '
+                'tau_crit mode Pc blend.',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+
+        # ----- Resuspension height (where a resuspended element is placed) -----
+        # How the height above the bed is set when an element resuspends (Update 2):
+        #   'legacy'    - the original lift/gravity/drag ODE (vectorized solve_ivp),
+        #                 integrated for a fixed 120 s (reproduces existing runs).
+        #   'analytic'  - the closed-form force-balance EQUILIBRIUM of that same ODE
+        #                 (no solver, ~zero cost). NB the ODE is strongly overdamped
+        #                 and does not reach this equilibrium within the 120 s of
+        #                 'legacy', so for fine sediment 'analytic' gives larger
+        #                 heights than 'legacy' (same u* scaling, different magnitude).
+        #                 CAVEAT: for fine/cohesive sediment the ODE equilibrium is
+        #                 only reached over hours-to-days, so placing a particle there
+        #                 in one minute-to-hour step over-resuspends; 'analytic' is
+        #                 only timestep-consistent for fast-settling (coarse) grains.
+        #                 Prefer 'turbulent' for fine/cohesive material.
+        #   'reference' - place at a small reference height z_a and let the model's
+        #                 vertical_mixing() carry it (turbulence-settling balance).
+        #   'turbulent' - stochastic draw from the near-bed Rouse profile, with
+        #                 near-bed turbulence parameterized from u* (hybrid: this
+        #                 seeds the height, vertical_mixing() then evolves it).
+        self._add_config({
+            'vertical_mixing:resuspension_height_mode': {
+                'type': 'enum',
+                'enum': ['legacy', 'analytic', 'reference', 'turbulent'],
+                'default': 'turbulent',
+                'description':
+                'How the above-bed height of a resuspended element is determined. '
+                "Production default 'turbulent' (physical near-bed Rouse draw, "
+                "timestep-consistent); use 'legacy' to reproduce old ODE runs.",
+                'level': CONFIG_LEVEL_BASIC
+            }})
+        self._add_config({
+            'vertical_mixing:resuspension_reference_height': {
+                'type': 'float',
+                'default': 0.01,
+                'min': 1e-4,
+                'max': 100.0,
+                'units': 'm',
+                'description':
+                'Reference height z_a above the bed at which a resuspended element '
+                'is placed (reference mode) or from which the Rouse draw starts '
+                '(turbulent mode). Capped at 0.1*water_depth.',
+                'level': CONFIG_LEVEL_BASIC
+            }})
+        self._add_config({
+            'vertical_mixing:resuspension_seed_layer': {
+                'type': 'float',
+                'default': 5.0,
+                'min': 0.0,
+                'max': 1000.0,
+                'units': 'm',
+                'description':
+                'Upper bound on the thickness above z_a over which the turbulent-mode '
+                'Rouse draw can place a resuspended element in one step; the actual '
+                'cap is min(this, kappa*u*dt), i.e. never more than turbulent '
+                'diffusion can carry the particle in one time step. '
+                'vertical_mixing() evolves it further afterwards.',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+        self._add_config({
+            'vertical_mixing:rouse_beta': {
+                'type': 'float',
+                'default': 1.0,
+                'min': 0.1,
+                'max': 5.0,
+                'units': '1',
+                'description':
+                'Sediment/momentum turbulent diffusivity ratio (inverse turbulent '
+                'Schmidt number) beta in the Rouse number P=w_s/(beta*kappa*u*).',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+        self._add_config({
+            'vertical_mixing:rouse_suspension_number': {
+                'type': 'float',
+                'default': 2.5,
+                'min': 0.5,
+                'max': 10.0,
+                'units': '1',
+                'description':
+                'Rouse number P above which an element cannot be suspended and is '
+                'kept in the near-bed (bedload) layer at z_a (turbulent mode).',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
 
         # By default, sediments do not strand towards coastline
         # TODO: A more sophisticated stranding algorithm is needed
@@ -268,7 +619,6 @@ class SedimentDrift(OceanDrift):
         self._set_config_default('drift:vertical_mixing', True)
 
         self.use_parallel = True
-        self._warned_bottom_stress_disabled = False
 
     def update(self):
         """Update positions and properties of sediment particles.
