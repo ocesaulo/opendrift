@@ -1243,38 +1243,240 @@ class SedimentDrift(OceanDrift):
         return array[idx], idx
 
 
-    def calc_resuspension_depth(self, bottom_stress, resuspending, rtol=1e-1, atol=1e-5, dameth='BDF', batch_size=100, n_jobs=1):
+    def calc_resuspension_height(self, bottom_stress, resuspending):
+        """Above-bed height [m] for each resuspending element (Update 2).
 
-        # Extract environmental parameters for active particles.
+        Dispatches on config 'vertical_mixing:resuspension_height_mode'. Returns a
+        subset-length array (one value per True entry in `resuspending`), matching
+        the legacy `calc_resuspension_depth` contract used by `resuspension()`.
+
+          'legacy'    - the original lift/gravity/drag ODE (vectorized solve_ivp),
+                        integrated 120 s (reproduces existing runs).
+          'analytic'  - the closed-form force-balance equilibrium of that same ODE
+                        z_eq = ln2*u* * sqrt(3 C_l rho_f / (8 r rho_s g (1-rho_f/rho_s))).
+                        The ODE is overdamped and does not reach z_eq within the 120 s
+                        of 'legacy', so this gives larger heights for fine sediment
+                        (same u* scaling, different magnitude) -- it is the equilibrium
+                        the ODE asymptotes to, not a reproduction of 'legacy'.
+          'reference' - a small reference height z_a (then vertical_mixing carries it).
+          'turbulent' - stochastic near-bed Rouse draw with u*-parameterized
+                        turbulence (then vertical_mixing carries it).
+        """
+        mode = self.get_config('vertical_mixing:resuspension_height_mode')
+        if mode == 'legacy':
+            return self.calc_resuspension_depth(bottom_stress, resuspending)
+
+        # Common near-bed quantities on the resuspending subset.
         temp = self.environment['sea_water_temperature'][resuspending]
         sal = self.environment['sea_water_salinity'][resuspending]
-        rho_f = self.sea_water_density(temp, sal)
+        rho_f = np.asarray(self.sea_water_density(temp, sal), dtype=float)
+        bot = np.maximum(bottom_stress[resuspending].astype(float), 0.0)
+        u_star = np.sqrt(bot / rho_f)
+        n = int(np.count_nonzero(resuspending))
 
-        C_l = self.elements.C_l[resuspending]
-        rho_s = self.elements.rho_s[resuspending]
+        if mode == 'analytic':
+            g = 9.81
+            C_l = self.elements.C_l[resuspending].astype(float)
+            rho_s = self.elements.rho_s[resuspending].astype(float)
+            r = self.elements.grain_diameter[resuspending].astype(float) / 2.0
+            buoy = np.maximum(1.0 - rho_f / rho_s, 1e-6)
+            return np.log(2.0) * u_star * np.sqrt(
+                3.0 * C_l * rho_f / (8.0 * r * rho_s * g * buoy))
+
+        # reference / turbulent: need the local water depth and reference height.
+        h = np.maximum(
+            self.environment['sea_floor_depth_below_sea_level'][resuspending].astype(float),
+            0.1)
+        za = np.minimum(self.get_config('vertical_mixing:resuspension_reference_height'),
+                        0.1 * h)
+
+        if mode == 'reference':
+            return za
+
+        # turbulent: stochastic Rouse draw (global seeded RNG via np.random).
+        # Cap the single-step seed at the distance turbulent diffusion can actually
+        # carry a particle in one model time step, kappa*u*dt, so the scheme stays
+        # consistent with the time step (never seeds higher than physically
+        # reachable per step); vertical_mixing() then evolves it further. This
+        # makes 'turbulent' timestep-consistent for any dt (see RESUSPENSION_MECHANICS_PLAN.md).
+        w_s = np.abs(self.elements.terminal_velocity[resuspending].astype(float))
+        dt = self.time_step.total_seconds()
+        seed_layer = np.minimum(
+            self.get_config('vertical_mixing:resuspension_seed_layer'),
+            rouse.KAPPA * u_star * dt)
+        U = np.random.uniform(size=n)
+        return rouse.resuspension_height(
+            u_star, w_s, h, za, seed_layer=seed_layer,
+            beta=self.get_config('vertical_mixing:rouse_beta'),
+            P_crit=self.get_config('vertical_mixing:rouse_suspension_number'),
+            U=U)
+
+    def calc_resuspension_depth(self, bottom_stress, resuspending, rtol=1e-1, atol=1e-5, dameth='BDF'):
+        """Legacy resuspension-height ODE (the `legacy` height mode).
+
+        Integrates the lift/gravity/Stokes-drag particle-motion ODE for 120 s and
+        returns the above-bed height. Same physics as before, but the previous
+        joblib-process / batched implementation has been replaced by a single
+        vectorized `solve_ivp` call with an analytic SPARSE Jacobian:
+
+          * one solver call (no joblib process spawn/pickle overhead, no batching);
+          * the per-particle dynamics are decoupled, so the 2n x 2n Jacobian is
+            sparse (3n non-zeros). Supplying it analytically avoids the O(n)
+            finite-difference RHS evaluations per Jacobian and lets BDF use sparse
+            linear algebra, so the cost scales ~O(n) instead of the dense O((2n)^3).
+
+        Results match the old batched version to within the solver tolerance.
+        """
+        gravity = 9.81
+        temp = self.environment['sea_water_temperature'][resuspending]
+        sal = self.environment['sea_water_salinity'][resuspending]
+        rho_f = np.asarray(self.sea_water_density(temp, sal), dtype=float)
+
+        C_l = self.elements.C_l[resuspending].astype(float)
+        rho_s = self.elements.rho_s[resuspending].astype(float)
+        r = self.elements.grain_diameter[resuspending].astype(float) / 2.0
+        mu = self.elements.viscosity_molecular[resuspending].astype(float)
+        u_star = np.sqrt(np.maximum(bottom_stress[resuspending].astype(float), 0.0) / rho_f)
+
+        n = int(np.count_nonzero(resuspending))
+        if n == 0:
+            return np.array([])
+
+        params = (C_l, rho_f, rho_s, u_star, r, mu, np.full(n, gravity))
+
+        # Per-particle Jacobian constants: lift = B/z^2, drag term = drag_c * w.
+        B = (0.5 * 3.0 * C_l * rho_f / (4.0 * r * rho_s)) * (u_star ** 2) * (np.log(2.0) ** 2)
+        drag_c = 9.0 * mu / (2.0 * r ** 2 * rho_s)
+        jrows, jcols = _resuspension_ode_jacobian_pattern(n)
+        ones_n = np.ones(n)
+
+        def jac(t, y):
+            z = y[:n]
+            z_fixed = np.where(z == 0, 1e-8, z)
+            d_dwdt_dz = -2.0 * B / z_fixed ** 3
+            data = np.concatenate([ones_n, d_dwdt_dz, -drag_c])
+            return sparse.csr_matrix((data, (jrows, jcols)), shape=(2 * n, 2 * n))
+
+        z0 = np.full(n, 1e-3 + 1e-8)
+        y0 = np.concatenate([z0, np.zeros(n)])   # state ordered [z block, w block]
+
+        sol = solve_ivp(
+            fun=lambda t, y: particle_motion_vectorized(t, y, params),
+            t_span=(0, 120), y0=y0, method=dameth, jac=jac,
+            rtol=rtol, atol=atol)
+
+        if not sol.success:
+            raise RuntimeError("ODE integration failed: " + sol.message)
+
+        return sol.y[:n, -1]
+
+
+    # def particle_motion_vectorized(self, t, y_flat, params):
+    #     """
+    #     Vectorized ODE right-hand side.
         
-        grain_diameter = self.elements.grain_diameter[resuspending]
- 
-        bot_stress = bottom_stress[resuspending]
-        mu = self.elements.viscosity_molecular[resuspending]
+    #     Parameters:
+    #     - t: time (scalar)
+    #     - y_flat: flattened state array of length 2*n_particles. It is assumed
+    #                 that the first n entries are z for each particle and the next n entries are w.
+    #     - params: tuple of parameter arrays:
+    #         (Cl, rho_f, rho_s, u_star, r, mu, g)
+    #         each of shape (n_particles,)
+        
+    #     Returns:
+    #     - dydt_flat: flattened derivative array of the same length.
+    #     """
+    #     # Determine the number of particles.
+    #     n = y_flat.size // 2
+    #     # Reshape the state: first row is z, second is w.
+    #     y = y_flat.reshape((2, n))
+    #     z = y[0, :]   # particle positions
+    #     w = y[1, :]   # particle velocities
+        
+    #     # Unpack parameter arrays.
+    #     Cl, rho_f, rho_s, u_star, r, mu, g = params
+        
+    #     # Prevent division by zero: if z == 0, substitute a small value.
+    #     z_fixed = np.where(z == 0, 1e-8, z)
+        
+    #     # Compute the force terms:
+    #     # Lift force term.
+    #     lift_term = (0.5 * 3 * Cl * rho_f / (4 * r * rho_s)) * (u_star**2 * (np.log(2))**2) / (z_fixed**2)
+    #     # Gravity/buoyancy term.
+    #     gravity_term = g * (1 - rho_f / rho_s)
+    #     # Drag force term.
+    #     drag_term = (9 * mu / (2 * r**2 * rho_s)) * w
+        
+    #     # Compute derivatives.
+    #     dw_dt = lift_term - gravity_term - drag_term
+    #     dz_dt = w  # time derivative of z is the velocity w
+        
+    #     # Stack derivatives into a 2 x n array and flatten it.
+    #     dydt = np.vstack((dz_dt, dw_dt))
+    #     return dydt.flatten()
 
-        n_resuspending = np.count_nonzero(resuspending)
-        # print(n_resuspending, 'resuspending particles')
-        if n_resuspending > 300:
-            n_jobs = 2
+    # def calc_resuspension_depth(self, bottom_stress, resuspending):
+    #     """
+    #     Compute the resuspension depth (i.e. the final particle z position) using a vectorized
+    #     ODE integration for all active particles (where resuspending is True). The integration
+    #     is performed in one batch call to solve_ivp.
+        
+    #     For inactive particles (where resuspending is False), the output is set to NaN.
+    #     """
+    #     gravity = 9.81
 
-        active_indices = np.arange(n_resuspending)
-        batches = [active_indices[i:i+batch_size] for i in range(0, n_resuspending, batch_size)]
+    #     # Extract environmental parameters for active particles.
+    #     temp = self.environment['sea_water_temperature'][resuspending]
+    #     sal = self.environment['sea_water_salinity'][resuspending]
+    #     rho_f = self.sea_water_density(temp, sal)
 
-        results = Parallel(n_jobs=n_jobs, prefer='processes')(
-            delayed(solve_batch)(batch, rho_f, rho_s, C_l, mu, grain_diameter, bot_stress, rtol, atol, dameth) for batch in batches
-        )
+    #     C_l = self.elements.C_l[resuspending]
+    #     rho_s = self.elements.rho_s[resuspending]
+    #     bot_stress = bottom_stress[resuspending]
+        
+    #     u_star = np.sqrt(bot_stress / rho_f)
+    #     r = self.elements.grain_diameter[resuspending] / 2
+    #     mu = self.elements.viscosity_molecular[resuspending]
 
-        z_final_all = np.full(n_resuspending, np.nan)
-        for idx_local, z_local in results:
-            z_final_all[idx_local] = z_local
-
-        return z_final_all
+    #     # Initial conditions for the ODE.
+    #     z0_offset = 1e-8
+    #     z0_base = 1e-3  # roughness height
+    #     z0_initial = z0_base + z0_offset
+    #     n_active = np.count_nonzero(resuspending)
+    #     print(n_active, 'resuspending particles')
+        
+    #     # Build initial condition arrays for active particles.
+    #     z0_array = np.full(n_active, z0_initial)
+    #     w0_array = np.zeros(n_active)
+        
+    #     # Arrange the state as a 2 x n_active array and flatten it.
+    #     y0 = np.vstack((z0_array, w0_array)).flatten()
+        
+    #     # Integration settings.
+    #     npts = 100
+    #     t_end = 120  # integration time in seconds
+    #     t_span = (0, t_end)
+    #     t_eval = np.linspace(t_span[0], t_span[1], npts)
+        
+    #     # Pack parameters for all active particles into arrays.
+    #     # Each parameter array should have shape (n_active,).
+    #     params = (C_l, rho_f, rho_s, u_star, r, mu, np.full(n_active, gravity))
+        
+    #     # Solve the ODE system for all active particles in one call.
+    #     sol = solve_ivp(
+    #         fun=lambda t, y: self.particle_motion_vectorized(t, y, params),
+    #         t_span=t_span, y0=y0, t_eval=t_eval, method='BDF',
+    #         rtol=1e-1, atol=1e-5    )
+        
+    #     if not sol.success:
+    #         raise RuntimeError("ODE integration failed: " + sol.message)
+        
+    #     # The final state is given by sol.y[:, -1] with shape (2*n_active,).
+    #     # Reshape it into a 2 x n_active array.
+    #     final_state = sol.y[:, -1].reshape((2, n_active))
+    #     z_final = final_state[0, :]  # Extract the final z positions for all active particles.
+        
+    #     return z_final
 
 
     def calc_upward_resuspension_velocity(self, bottom_stress, resuspending):
