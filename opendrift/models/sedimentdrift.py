@@ -640,12 +640,74 @@ class SedimentDrift(OceanDrift):
 
         if self.get_config('drift:vertical_mixing') is False:
             self.vertical_buoyancy()
+            # self.vertical_advection()
         else:
             self.vertical_mixing() # including buoyancy and settling
 
-        self.deactivate_elements_outofbounds()
+
+        self.deactivate_elements_outofbounds()       
+
+        # upwards_moving_particles = self.elements.counter == 1
+        # Restore downwards velocity to resuspended particles
+        # self.elements.terminal_velocity[upwards_moving_particles] = self.elements.terminal_velocity_default[upwards_moving_particles]
+        # self.elements.counter[upwards_moving_particles] = 0
+
+        # self.resuspension()
         self.deactivate_elements(self.elements.beached == 1, reason='beached')
         self.remove_deactivated_elements()
+
+    def update_terminal_velocity(self, Tprofiles=None, Sprofiles=None, z_index=None):
+        """Per-element settling (terminal) velocity from the configured closure.
+
+        Overrides the OceanDrift stub, which the base model already calls every
+        step inside vertical_mixing() (and once before the run). The closure
+        (config 'vertical_mixing:settling_model') maps each element's innate
+        properties (grain_diameter, rho_s, fractal_dim, d0, corey_shape_factor)
+        and the *local* fluid (rho_f from T/S, kinematic viscosity from the
+        molecular viscosity config) to a settling speed via models/settling.py;
+        terminal_velocity is stored negative (downward).
+
+        Static vs dynamic (config 'vertical_mixing:settling_dynamic'):
+          * False (default) - compute only for elements not yet set (vel_set==0),
+            i.e. once at first activation, then hold fixed. Cheap, seed-time static.
+          * True - recompute for all active elements every step (rho_f, nu follow
+            the local T/S), giving a dynamic terminal velocity with no other change.
+
+        The legacy 'prescribed' model is a no-op: terminal_velocity keeps whatever
+        was seeded / set by SedimentElement.move_elements (back-compat).
+        """
+        model = self.get_config('vertical_mixing:settling_model')
+        if model == 'prescribed':
+            return
+
+        if self.get_config('vertical_mixing:settling_dynamic'):
+            idx = np.ones(self.elements.z.shape, dtype=bool)
+        else:
+            idx = self.elements.vel_set == 0
+        if not np.any(idx):
+            return
+
+        # Local fluid: density from in-situ T/S, kinematic viscosity from the
+        # configured molecular (dynamic) viscosity. Same provenance as the SG2000
+        # bed stress and the dynamic tau_crit closure.
+        temp = self.environment['sea_water_temperature'][idx]
+        sal = self.environment['sea_water_salinity'][idx]
+        rho_f = np.broadcast_to(
+            np.asarray(self.sea_water_density(temp, sal), dtype=float),
+            (int(np.count_nonzero(idx)),)).astype(float)
+        nu = self.get_config('environment:molecular_viscosity') / rho_f  # m^2/s
+
+        w = settling.settling_velocity(
+            model,
+            d=self.elements.grain_diameter[idx].astype(float),
+            rho_s=self.elements.rho_s[idx].astype(float),
+            rho_f=rho_f, nu=nu,
+            corey_shape_factor=self.elements.corey_shape_factor[idx].astype(float),
+            d0=self.elements.d0[idx].astype(float),
+            fractal_dim=self.elements.fractal_dim[idx].astype(float))
+
+        self.elements.terminal_velocity[idx] = -w   # negative == sinking
+        self.elements.vel_set[idx] = 1
 
     def deactivate_elements_outofbounds(self):
         # This only works if the first reader you passed to the model
@@ -660,6 +722,7 @@ class SedimentDrift(OceanDrift):
         lons, lats = self.elements.lon, self.elements.lat
         out_of_bounds = (lons < lon_min) | (lons > lon_max) | (lats < lat_min) | (lats > lat_max)
         self.deactivate_elements(out_of_bounds, reason='out of bounds')
+        # self.remove_deactivated_elements()
 
     def bottom_interaction(self, seafloor_depth):
         """Sub method of vertical_mixing and vertical_buoyancy, determines settling"""
