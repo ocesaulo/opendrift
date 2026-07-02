@@ -98,6 +98,29 @@ class SedimentElement(Lagrangian3DArray):
         ('tau_crit', {'dtype': np.float32,
                       'units': 'Pa',
                       'default': 0.09}),
+        # Sediment behaviour class for the dynamic tau_crit closure:
+        # 0 = non-cohesive/solid grain (Shields), 1 = cohesive floc (fractal strength).
+        # Default 0; a size-cutoff default is applied at the first resuspension
+        # step for elements left at 0 with a sub-cutoff grain size (see
+        # _critical_shear_stress). Only used when tau_crit_mode != 'constant'.
+        ('sed_class', {'dtype': np.uint8,
+                      'units': '1',
+                      'default': 0}),
+        # Floc fractal dimension Df (cohesive elements). Marine flocs ~1.7-2.3.
+        ('fractal_dim', {'dtype': np.float32,
+                      'units': '1',
+                      'default': 2.0}),
+        # Fresh (as-deposited) solids volume fraction phi0 of a cohesive floc;
+        # consolidation grows it toward consolidated_solids_fraction over time.
+        ('phi0', {'dtype': np.float32,
+                      'units': '1',
+                      'default': 0.1}),
+        # Time (s) an element has been settled on the bed; drives consolidation
+        # of the cohesive critical shear stress. Reset to 0 on (re)settling and
+        # on resuspension.
+        ('time_since_settled', {'dtype': np.float32,
+                      'units': 's',
+                      'default': 0}),
         ('rho_s', {'dtype': np.float32,
                       'units': 'kgm-3',
                       'default': 2000}),
@@ -125,6 +148,25 @@ class SedimentElement(Lagrangian3DArray):
                      'default': 0}),
         ('latest_resuspension_height', {'dtype': np.float32,
                       'units': 'm',
+                      'default': 0}),
+        # ----- settling-velocity (terminal velocity) closure inputs -----
+        # Primary (constituent) particle size of a fractal aggregate, used by the
+        # 'maggi'/'maggi_permeable' settling models for the mass-size relation
+        # (d/d0)**(Df-3). For a solid grain set d0 = grain_diameter (the seeding
+        # layer does this), giving an effective density == rho_s.
+        ('d0', {'dtype': np.float32,
+                      'units': 'm',
+                      'default': 4e-6}),
+        # Corey shape factor S/sqrt(L*I) of the grain (1 = sphere), used by the
+        # 'bb16' settling model's drag-correction factors.
+        ('corey_shape_factor', {'dtype': np.float32,
+                      'units': '1',
+                      'default': 1.0}),
+        # Set to 1 once update_terminal_velocity() has computed this element's
+        # settling velocity, so the static (non-dynamic) closure computes it once
+        # at first activation instead of every step. Ignored when settling_dynamic.
+        ('vel_set', {'dtype': np.uint8,
+                      'units': '1',
                       'default': 0})
         ])
 
@@ -162,6 +204,7 @@ class SedimentDrift(OceanDrift):
         'y_wind': {'fallback': 0},
         'sea_surface_wave_stokes_drift_x_velocity': {'fallback': 0},
         'sea_surface_wave_stokes_drift_y_velocity': {'fallback': 0},
+        'sea_surface_wave_significant_height': {'fallback': 0},
         'sea_surface_wave_period_at_variance_spectral_density_maximum': {'fallback': 0},
         'sea_surface_wave_mean_period_from_variance_spectral_density_second_frequency_moment': {'fallback': 0},
         'land_binary_mask': {'fallback': None},
