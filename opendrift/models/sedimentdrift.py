@@ -26,7 +26,11 @@ from opendrift.models.oceandrift import Lagrangian3DArray
 from opendrift.config import CONFIG_LEVEL_ESSENTIAL, CONFIG_LEVEL_BASIC, CONFIG_LEVEL_ADVANCED
 from datetime import datetime
 from scipy.integrate import solve_ivp
-from joblib import Parallel, delayed
+from scipy import sparse
+from opendrift.models.bblm_sg2000 import sg2000_solve
+from opendrift.models import floc_strength
+from opendrift.models import rouse
+from opendrift.models import settling
 import math
 
 
@@ -49,36 +53,18 @@ def particle_motion_vectorized(t, y_flat, params):
     return dydt.flatten()
 
 
-def solve_batch(batch, rho_f, rho_s, C_l, mu, grain_diameter, bot_stress, rtol, atol, dameth):
-    gravity = 9.81
-    rho_f_b = rho_f[batch]
-    rho_s_b = rho_s[batch]
-    C_l_b = C_l[batch]
-    mu_b = mu[batch]
+def _resuspension_ode_jacobian_pattern(n):
+    """Constant (row, col) index arrays for the block-structured Jacobian of the
+    resuspension ODE (state ordered [z_0..z_{n-1}, w_0..w_{n-1}]).
 
-    r = grain_diameter[batch] / 2
-    u_star = np.sqrt(bot_stress[batch] / rho_f_b)
-    g_b = np.full_like(r, gravity)
-
-    z0_offset = 1e-8
-    z0_base = 1e-3
-    z0_initial = z0_base + z0_offset
-    z0 = np.full(len(batch), z0_initial)
-    w0 = np.zeros(len(batch))
-    y0 = np.vstack((z0, w0)).flatten()
-    params = (C_l_b, rho_f_b, rho_s_b, u_star, r, mu_b, g_b)
-
-    sol = solve_ivp(
-        fun=lambda t, y: particle_motion_vectorized(t, y, params),
-        t_span=(0, 120), y0=y0, method=dameth,
-        rtol=rtol, atol=atol
-    )
-
-    if not sol.success:
-        raise RuntimeError("ODE integration failed: " + sol.message)
-
-    final_state = sol.y[:, -1].reshape((2, len(batch)))
-    return batch, final_state[0, :]
+    Non-zeros: d(dz/dt)/dw = I, d(dw/dt)/dz = diag, d(dw/dt)/dw = diag -> 3n entries.
+    The system is decoupled across particles, so the Jacobian is sparse and the
+    sparse BDF solve scales ~O(n) instead of the O((2n)^3) of a dense Jacobian.
+    """
+    idx = np.arange(n)
+    rows = np.concatenate([idx, n + idx, n + idx])
+    cols = np.concatenate([n + idx, idx, n + idx])
+    return rows, cols
 
 
 class SedimentElement(Lagrangian3DArray):
