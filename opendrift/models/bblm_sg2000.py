@@ -1,8 +1,9 @@
 """
 Styles & Glenn (2000) neutral combined wave-current bottom boundary layer model.
 
-Vectorized NumPy port of the reference MATLAB implementation in this folder
-(bblm02.m / bstress2.m / phi2_1.m / pwave.m / shldc.m). All quantities are in
+Vectorized NumPy port of the authors' reference MATLAB implementation, kept in
+``tests/test_data/sppm/matlab_sg2000/`` (bblm02.m / bstress2.m / phi2_1.m /
+pwave.m / shldc.m). All quantities are in
 **cgs units** internally (cm, cm/s, cm/s^2), matching the MATLAB code and the
 UserTestCase. The integration layer (SedimentDrift) is responsible for any
 SI<->cgs conversion.
@@ -21,7 +22,8 @@ Reference:
     boundary layers on the continental shelf. JGR, 105(C10), 24119-24139.
     Styles, Glenn & Brown, 2017: ERDC/CHL TR-17-11 (optimized arbitrary roughness).
 
-Validation: see test_sg2000.py (reproduces UserTestCase Table 2 from test2.mat).
+Validation: ``tests/models/test_bblm_sg2000.py`` reproduces UserTestCase Table 2
+from ``tests/test_data/sppm/test2.mat``.
 """
 
 import numpy as np

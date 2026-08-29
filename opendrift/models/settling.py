@@ -2,7 +2,8 @@
 
 Vendored alongside ``bblm_sg2000.py`` / ``floc_strength.py`` / ``rouse.py`` so the
 installed SedimentDrift model stays self-contained: it does NOT import the offline
-research code in ``codes/settling_models.py`` / ``codes/maggi.py``. The relevant
+research code (``settling_models.py`` / ``maggi.py``, which live outside this
+repository in the ``ddt_dump`` project). The relevant
 physics is small and reproduced here as pure-NumPy, fully vectorized functions,
 with the bugs of those research modules fixed:
 

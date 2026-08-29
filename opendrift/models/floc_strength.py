@@ -1,11 +1,13 @@
 """Critical-shear-stress closures for SedimentDrift resuspension.
 
 Vendored alongside ``bblm_sg2000.py`` so the installed SedimentDrift model stays
-self-contained: it does NOT import the offline ``codes/maggi.py`` /
-``codes/settling_models.py``. The relevant physics is small and reproduced here
-as pure-NumPy, fully vectorized functions.
+self-contained: it does NOT import the offline research code (``maggi.py`` /
+``settling_models.py``, which live outside this repository in the ``ddt_dump``
+project). The relevant physics is small and reproduced here as pure-NumPy, fully
+vectorized functions.
 
-Two regimes (see RESUSPENSION_MECHANICS_PLAN.md, Update 1):
+Two regimes (design notes: ``docs/sppmdrift/M2_burial_and_thresholds.md``, and
+the external ``ddt_dump/RESUSPENSION_MECHANICS_PLAN.md``, Update 1):
 
 * Non-cohesive grains -- Soulsby & Whitehouse (1997) fit to the Shields curve,
   a function of the grain's own size/density and the ambient fluid.
