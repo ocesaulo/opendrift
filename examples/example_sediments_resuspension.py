@@ -27,8 +27,24 @@ else:  # Using live data from Thredds instead of oscillating currents
         'https://thredds.met.no/thredds/dodsC/sea/norkyst800m/1h/aggregate_be'])
 
 #%%
-# Set threshold for bottom resuspension
-o.set_config('vertical_mixing:resuspension_threshold', .5)
+# Set the threshold for bottom resuspension.
+#
+# Settled elements are resuspended when the bed shear stress exceeds their
+# critical shear stress. Both sides of that comparison are configurable:
+#
+#   vertical_mixing:bbl_scheme     how the bed stress is computed ('sg2000',
+#                                  the Styles & Glenn combined wave-current BBL,
+#                                  or 'legacy'). The oscillating readers below
+#                                  supply no waves, so SG2000 reduces to the
+#                                  current-only law of the wall.
+#   vertical_mixing:tau_crit_mode  how the threshold is set. 'constant' uses the
+#                                  per-element tau_crit given at seeding; the
+#                                  default 'auto' derives it from each element's
+#                                  grain size and class.
+#
+# Note: the older 'vertical_mixing:resuspension_threshold' (a current speed) is
+# no longer used by SedimentDrift.resuspension() and setting it has no effect.
+o.set_config('vertical_mixing:tau_crit_mode', 'constant')
 
 # Adding some horizontal and vertical diffusion
 o.set_config('drift:current_uncertainty', 0.1)
@@ -38,9 +54,10 @@ o.set_config('vertical_mixing:diffusivitymodel', 'windspeed_Large1994')
 
 #%%
 # Seeding sediments
-o.seed_elements(lon=4.65, lat=60, number=10000, 
+o.seed_elements(lon=4.65, lat=60, number=10000,
                 time=[datetime.utcnow(), datetime.utcnow()+timedelta(hours=6)],
-                terminal_velocity=-.01)  # 1 cm/s settling speed
+                terminal_velocity=-.01,  # 1 cm/s settling speed
+                tau_crit=.05)  # Pa, critical shear stress for resuspension
 
 o.run(time_step=1800, time_step_output=1800, duration=timedelta(hours=72))
 
