@@ -60,6 +60,19 @@ no functionality.
 
 ## 5. Left undone
 
+- **The two trees have diverged again, as predicted.** The M0/M1 commits changed
+  `opendrift/models/sedimentdrift.py` in the fork, and
+  `lana_opendrift/.../site-packages/opendrift/` is a hand-copied duplicate, so the
+  production environment is now *behind* the fork.
+
+  This is safe today — the changes are behaviour-neutral and both environments
+  report identical production defaults (`tau_crit_mode='auto'`,
+  `resuspension_height_mode='turbulent'`, `bottom_drag_coefficient=0.0021`), so
+  DDT runs are unaffected either way. But it will not stay safe. **The fix is to
+  make `lana_opendrift` an editable install of the fork**, as `opendrift_dev`
+  already is; that touches the production environment, so it is left for
+  S. Soares to approve rather than done unilaterally.
+
 - `pytest` had to be installed into `opendrift_dev`; it is still absent from
   `lana_opendrift`, so the suite cannot be run there.
 - The `sppm/` package reorganisation in `ARCHITECTURE.md` is **not** done. It
