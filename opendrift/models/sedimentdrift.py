@@ -375,6 +375,32 @@ class SedimentDrift(OceanDrift):
                 'ratio s in skin friction / ripple roughness.',
                 'level': CONFIG_LEVEL_BASIC
             }})
+        self._add_config({
+            'vertical_mixing:erosion_rate_constant': {
+                'type': 'float',
+                'default': 5e-5,
+                'min': 0.0,
+                'max': 1.0,
+                'units': 'kgm-2s-1',
+                'description':
+                'Erosion-rate constant E_0 of the ambient seabed, used by the '
+                '(currently unused) Ariathurai-Partheniades pickup velocity. '
+                'A bed property, not a particle property.',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
+        self._add_config({
+            'vertical_mixing:bed_porosity': {
+                'type': 'float',
+                'default': 0.6,
+                'min': 0.0,
+                'max': 1.0,
+                'units': '1',
+                'description':
+                'Porosity of the ambient seabed, used by the (currently unused) '
+                'Ariathurai-Partheniades pickup velocity. A bed property, not a '
+                'particle property.',
+                'level': CONFIG_LEVEL_ADVANCED
+            }})
 
         # How the near-bed REFERENCE velocity (input to every BBL stress scheme) is
         # obtained for settled elements. The reader call to get it dominates runtime
@@ -1097,7 +1123,7 @@ class SedimentDrift(OceanDrift):
         scheme = self.get_config('vertical_mixing:bbl_scheme')
         if scheme == 'legacy':
             r_b = 0
-            c_d = 0.0021
+            c_d = self.get_config('vertical_mixing:bottom_drag_coefficient')
             crit_last_layer_thickness = 1.
             vel_mag = np.sqrt(env['u'] ** 2 + env['v'] ** 2)
             turb_contrib = np.zeros(env['n_active'])
@@ -1298,7 +1324,7 @@ class SedimentDrift(OceanDrift):
         # carry a particle in one model time step, kappa*u*dt, so the scheme stays
         # consistent with the time step (never seeds higher than physically
         # reachable per step); vertical_mixing() then evolves it further. This
-        # makes 'turbulent' timestep-consistent for any dt (see RESUSPENSION_MECHANICS_PLAN.md).
+        # makes 'turbulent' timestep-consistent for any dt (see docs/sppmdrift/).
         w_s = np.abs(self.elements.terminal_velocity[resuspending].astype(float))
         dt = self.time_step.total_seconds()
         seed_layer = np.minimum(
@@ -1480,10 +1506,23 @@ class SedimentDrift(OceanDrift):
 
 
     def calc_upward_resuspension_velocity(self, bottom_stress, resuspending):
-        # Calculate the upwards velocity to give particle getting resuspended.
-        # Equation adapted from https://doi.org/10.1061/JYCEAJ.0004937
-        E_0 = self.elements.E_0[resuspending]
-        porosity = self.elements.porosity[resuspending]
+        """Ariathurai-Partheniades style pickup velocity [m/s]. Currently unused.
+
+        Equation adapted from https://doi.org/10.1061/JYCEAJ.0004937
+
+        The erosion-rate constant E_0 and the bed porosity are properties of the
+        *bed*, not of the tracked particle, so they are read from config -- the
+        same separation already applied to the bed grain size and density used by
+        the bed-stress schemes. They were previously read from element variables
+        that do not exist on SedimentElement, so any call raised AttributeError.
+
+        NOTE: the excess-stress normalisation used here, (tau - tau_c)/tau, is not
+        the (tau/tau_c - 1) form of the Ariathurai-Partheniades erosion flux used
+        in ROMS/COAWST. Which to adopt is a physics question for the burial and
+        thresholds work; the numerics are left exactly as found.
+        """
+        E_0 = self.get_config('vertical_mixing:erosion_rate_constant')
+        porosity = self.get_config('vertical_mixing:bed_porosity')
         rho_s = self.elements.rho_s[resuspending]
         tau_crit = self.elements.tau_crit[resuspending]
         bot_stress = bottom_stress[resuspending]
