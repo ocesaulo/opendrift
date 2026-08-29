@@ -205,9 +205,34 @@ pass/fail.
 - **`cohesive_strength_coeff = 100` is uncalibrated** and sets the absolute
   cohesive threshold. S3 and S2 are the first real constraint on it. Calibration
   itself is M2.
+- **RESOLVED by the campaign:** the pickup-flux question above is now answered —
+  F2 and F3 in the report show a threshold cannot reproduce event intensity or a
+  plausible lift-off count, and they share a cause. Probabilistic erosion is
+  **required**, not optional. It remains M2/B4 work, but M2 should treat it as the
+  module's first item rather than an optional extra.
+- **NEW, from the campaign:** the reference model has a critical shear stress for
+  *deposition* (`tau_d`, Krone 1962) that we lack entirely (F4).
 - **Decided:** Wu et al. (2025) excluded from physics validation.
 - **Decided:** synthetic wave forcing for M1; no WW3 reader.
 
 ## 8. Status
 
-**In progress.** Literature gate cleared 2026-08-29; harness and cases to build.
+**Tier A and Tier B cases S3 and S1 built and run, 2026-08-29.** Full results and
+findings in [validation/REPORT.md](validation/REPORT.md). Headline:
+
+*The settling / mixing / deposition chain is sound* — Rouse exponent recovered,
+well-mixed condition satisfied, analytic deposition rate matched, and Sherwood's
+double-resuspension experiment reproduced for suspended-load ordering,
+deposition sequence and retention of the finest class.
+
+*The erosion side is not.* Four defects isolated:
+
+| | Finding | Fix belongs to |
+|---|---|---|
+| F1 | `mixed` threshold is not Sherwood Eq. 6: cohesive term uses the particle's own diameter rather than the bulk bed stress, and the `max(..., tau_c)` floor is missing. 0.6x to 14x wrong. | M2/B3 |
+| F2 | An all-or-nothing threshold cannot reproduce event-intensity scaling; a weaker second event resuspends 0.92x as much sand as the first, where the reference gives "minimal". | M2/B4 |
+| F3 | Settled elements above threshold re-lift **every step** — 44 lift-offs per sand particle over two events. **This is the mechanism behind the parent study's ~45 % fast-class domain loss.** | M2/B4 |
+| F4 | No critical shear stress for deposition (`tau_d`, Krone); we deposit unconditionally. Not anticipated in this plan. | M2 (new) |
+
+Remaining to build: S2 (blocked in practice by F1), W1, W2, and an idealized
+wave-forced case.
