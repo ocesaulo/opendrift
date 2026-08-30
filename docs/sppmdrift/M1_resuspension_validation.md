@@ -218,7 +218,8 @@ pass/fail.
 ## 8. Status
 
 **Tier A and Tier B cases S3 and S1 built and run, 2026-08-29.** Full results and
-findings in [validation/REPORT.md](validation/REPORT.md). Headline:
+findings in [validation/REPORT.md](validation/REPORT.md); one illustrated
+notebook per case in [validation/notebooks/](validation/notebooks/). Headline:
 
 *The settling / mixing / deposition chain is sound* — Rouse exponent recovered,
 well-mixed condition satisfied, analytic deposition rate matched, and Sherwood's
@@ -231,8 +232,9 @@ deposition sequence and retention of the finest class.
 |---|---|---|
 | F1 | `mixed` threshold is not Sherwood Eq. 6: cohesive term uses the particle's own diameter rather than the bulk bed stress, and the `max(..., tau_c)` floor is missing. 0.6x to 14x wrong. | M2/B3 |
 | F2 | An all-or-nothing threshold cannot reproduce event-intensity scaling; a weaker second event resuspends 0.92x as much sand as the first, where the reference gives "minimal". | M2/B4 |
-| F3 | Settled elements above threshold re-lift **every step** — 44 lift-offs per sand particle over two events. **This is the mechanism behind the parent study's ~45 % fast-class domain loss.** | M2/B4 |
+| F3 | Settled elements above threshold re-lift **every step** — 299 lift-offs per sand particle over two events. **This is the mechanism behind the parent study's ~45 % fast-class domain loss.** | M2/B4 |
 | F4 | No critical shear stress for deposition (`tau_d`, Krone); we deposit unconditionally. Not anticipated in this plan. | M2 (new) |
+| F6 | `times_resuspended` was `uint8` and wrapped silently at 255, corrupting its own diagnostic — and it is exported by the DDT production runs. Fixed to `uint32`. | **fixed** |
 
 Remaining to build: S2 (blocked in practice by F1), W1, W2, and an idealized
 wave-forced case.

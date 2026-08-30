@@ -74,6 +74,7 @@ separation-of-concerns contract every module must respect, are in
 | Physics tests | `tests/models/test_{bblm_sg2000,floc_strength,rouse,settling,sedimentdrift_bbl}.py` |
 | Test fixtures | `tests/test_data/sppm/` (+ `PROVENANCE.md`) |
 | Validation report | `docs/sppmdrift/validation/REPORT.md` |
+| Validation notebooks | `docs/sppmdrift/validation/notebooks/` (start at `00_overview.ipynb`) |
 | Papers | `ddt_dump/resuspension_mechanics/`, `ddt_dump/bblm_sg2000/` (external) |
 
 ## Running the physics tests

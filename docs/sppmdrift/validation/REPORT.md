@@ -3,6 +3,10 @@
 Status 2026-08-29. Tier A (analytic) and Tier B cases S3 and S1 are built and
 run; S2, W1 and W2 are not yet built.
 
+**Illustrated form:** [`notebooks/`](notebooks/) has one notebook per case, with
+the setup, the forcing, the result plotted against the reference, and a verdict.
+Start at [`notebooks/00_overview.ipynb`](notebooks/00_overview.ipynb).
+
 Run the suite with:
 
 ```
@@ -30,7 +34,7 @@ is the direct mechanism behind a blocker in the parent DDT study.
 |---|---|---|---|---|---|---|
 | A | Parabolic diffusivity | shape, peak value | 1 % | `kappa u* h/4` | matches | **pass** |
 | A | Settling column | settled fraction after 2 h | 0.05 | 0.72 (`w_s t/h`) | within tol | **pass** |
-| A | Well-mixed condition | max bin excursion, interior | 20 % | uniform | within tol | **pass** |
+| A | Well-mixed condition | max bin excursion, two regions | 20 % | uniform | 7.5 % / 10 % | **pass** |
 | A | Rouse profile, P = 0.25 | fitted exponent | 0.55–1.15 P | 0.25 | 0.223 | **pass** |
 | A | Rouse profile, P = 0.50 | fitted exponent | 0.55–1.15 P | 0.50 | 0.404 | **pass** |
 | B | S3 low-mud limit | tau_ce vs Shields | 1e-5 rel | identical | identical | **pass** |
@@ -41,14 +45,23 @@ is the direct mechanism behind a blocker in the parent DDT study.
 | B | S1 deposition order | order of clearing | by `w_s` | coarse first | 42.0/45.5/61.0/never h | **pass** |
 | B | S1 fines retained at day 5 | suspended fraction | > 0.5 | "mostly suspended" | 0.64 | **pass** |
 | B | S1 second-event suppression | peak2 / peak1, 140 um | < 0.25 | "minimal" | 0.92 | **FAIL (F2)** |
-| B | S1 lift-offs per particle | mean, 140 um | a few | a few | 44 | **FAIL (F3)** |
+| B | S1 lift-offs per particle | mean, 140 um | a few | a few | 299 | **FAIL (F3)** |
 | C | SG2000 Table 2 | max abs error, 15 entries | 0.15 | Table 2 | 0.000 | **pass** |
 | C | Settling vs Maggi (2013) | log10-RMSE, bb16 csf 0.7 | < 0.25 | — | 0.202 | **pass** |
 | C | Settling vs Maggi (2013) | log10-RMSE, dietrich | < 0.25 | — | 0.219 | **pass** |
 
+**A note on the well-mixed test.** As first written it checked only the interior
+10-90 % of the column, which quietly excluded almost all the variation in `K` --
+that band spans only a ~3x range. It now also checks the top 30 %, where the
+surface is a genuine reflecting boundary and `K` falls by more than four orders of
+magnitude; that is where a scheme missing the `dK/dz` correction would fail. The
+model passes both (7.5 % and 10 % maximum bin excursion).
+
 ## Findings
 
 ### F1 — the `mixed` threshold is not Sherwood's mixed-bed formulation
+
+*Notebook:* [`notebooks/04_S3_mixed_bed_closure.ipynb`](notebooks/04_S3_mixed_bed_closure.ipynb)
 
 Sherwood et al. (2018) Eq. 6 is
 
@@ -89,6 +102,8 @@ the near-zero resuspension already observed there.
 
 ### F2 — a threshold cannot reproduce event-intensity scaling
 
+*Notebook:* [`notebooks/05_S1_double_resuspension.ipynb`](notebooks/05_S1_double_resuspension.ipynb)
+
 Sherwood's second, weaker stress pulse "only resuspended minimal amounts of the
 140 um sand", because erosion there is a flux,
 `E = E_0 (1 - phi) (tau_b/tau_ce - 1)`, which scales with the excess stress.
@@ -106,24 +121,44 @@ wired into `resuspension()`, and its excess-stress normalisation
 
 ### F3 — settled elements re-lift on every time step
 
+*Notebook:* [`notebooks/05_S1_double_resuspension.ipynb`](notebooks/05_S1_double_resuspension.ipynb)
+
 Mean lift-offs per particle over the whole two-event experiment:
 
 | class | 4 um | 30 um | 62.5 um | 140 um |
 |---|---|---|---|---|
-| lift-offs per particle | 2.8 | 10.6 | 40.7 | 44.4 |
+| lift-offs per particle | 2.8 | 10.6 | 40.8 | **298.8** |
 
-Two stress events should give a few lift-offs per particle, not forty. A settled
+Two stress events should give a few lift-offs per particle, not three hundred. A settled
 element whose threshold is exceeded is resuspended *again on the next step*, and
 the coarse classes — which fall back to the bed quickly — cycle continuously.
 
 **This is the mechanism behind the parent study's blocker.** `ddt_dump/RECAP.md`
 records that the two fastest settling classes lose ~45 % of their particles out
 of the domain, which currently blocks the class-weight inversion. Each hop
-displaces a particle downstream; forty hops per event is a large random-walk
+displaces a particle downstream; three hundred hops is a large random-walk
 displacement that has nothing to do with the physics. Isolated here in a case
 with a known answer, the defect is unambiguous.
 
 F2 and F3 share a cause and would share a fix.
+
+### F6 — `times_resuspended` was an 8-bit counter and wrapped silently
+
+Found while writing the notebooks, when the same quantity came out as 44 in one
+analysis and 254 in another. `SedimentElement.times_resuspended` was declared
+`np.uint8`, so it **wraps at 255**: the live element array showed a mean of 44.6
+for the coarse class while the exported history peaked at exactly 255.0. Neither
+number was real — the true mean is **298.8**, with a maximum of 341.
+
+The counter is now `np.uint32` (`sedimentdrift.py:146`). Everything reported for
+F3 above uses the corrected values.
+
+**This reaches beyond the validation suite.** `times_resuspended` is in the
+`export_variables` list of the DDT production runs, so any analysis of
+resuspension counts in existing output is wrapped wherever a particle exceeded
+255 lift-offs — which, given F3, the fast classes certainly did. Those outputs
+cannot be re-derived without re-running, but the affected diagnostic should not
+be trusted.
 
 ### F4 — no critical shear stress for deposition
 
@@ -134,6 +169,8 @@ keep material in suspension in the bottom layer during an event. This was not
 anticipated in the M1 plan and is a new item for M2.
 
 ### F5 — the Rouse recovery is biased by the settle-and-resuspend cycle
+
+*Notebook:* [`notebooks/03_rouse_profile.ipynb`](notebooks/03_rouse_profile.ipynb)
 
 The recovered exponent is biased low (0.223 for P = 0.25; 0.404 for P = 0.50)
 because elements resting on the bed awaiting the next resuspension are not part
