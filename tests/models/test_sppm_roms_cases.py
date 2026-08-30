@@ -325,12 +325,15 @@ def test_s1_coarse_classes_hop_repeatedly(s1_run):
     """DOCUMENTED FAILURE: settled elements above threshold re-lift every step.
 
     A settled element whose critical stress is exceeded is lifted again on every
-    time step, so the coarse classes accumulate tens of resuspension events each
+    time step, so the coarse classes accumulate hundreds of resuspension events
     within two stress events. This is the mechanism behind the ~45 % out-of-domain
     loss of the fastest settling classes reported in the parent DDT study; here it
     is isolated in a case with a known answer.
 
     Two events should give at most a few lift-offs per particle.
+
+    Note: this diagnostic was itself unreliable until `times_resuspended` was
+    widened from uint8, which silently wrapped at 255.
     """
     per_particle = []
     for k in range(len(CLASS_D)):
@@ -340,4 +343,4 @@ def test_s1_coarse_classes_hop_repeatedly(s1_run):
         per_particle.append(np.nanmean(last))
     per_particle = np.array(per_particle)
     assert np.all(np.diff(per_particle) > 0), per_particle   # worse for coarser
-    assert per_particle[3] > 20.0, per_particle              # ~44 measured
+    assert per_particle[3] > 100.0, per_particle             # ~299 measured

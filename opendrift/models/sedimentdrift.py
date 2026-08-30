@@ -140,7 +140,10 @@ class SedimentElement(Lagrangian3DArray):
                       'units': '1',
                       'default': 1}),
         # keeps track of how many times a particle was resuspended
-        ('times_resuspended', {'dtype': np.uint8,
+        # An unbounded counter, so it must not be uint8: a coarse grain on an
+        # energetic bed can be lifted hundreds of times in a few days, and an
+        # 8-bit counter silently wraps at 255, corrupting the diagnostic.
+        ('times_resuspended', {'dtype': np.uint32,
                       'units': '1',
                       'default': 0}),
         ('beached', {'dtype': np.uint8,  # 0 is active, 1 is settled
