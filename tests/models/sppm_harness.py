@@ -143,15 +143,20 @@ def column_model(dataset, loglevel=50, mixing_timestep=60, **configs):
 
 def seed_column(o, reader, number, h, w_s, tau_crit=1e-9, z_min=0.01,
                 lon=8.0, lat=64.0, rng_seed=1, **kwargs):
-    """Seed `number` elements uniformly through the column."""
+    """Seed `number` elements uniformly through the column.
+
+    Returns the seeded depths. Seeded elements are held in `elements_scheduled`
+    until `run()` releases them, so `o.elements.z` is empty until then.
+    """
     np.random.seed(rng_seed)
+    z = -np.random.uniform(z_min, h, number)
     o.seed_elements(
-        lon=lon, lat=lat, number=number, time=reader.start_time,
-        z=-np.random.uniform(z_min, h, number),
+        lon=lon, lat=lat, number=number, time=reader.start_time, z=z,
         terminal_velocity=np.full(number, -abs(w_s)),
         tau_crit=np.full(number, tau_crit),
         use_stokes=np.zeros(number),
         **kwargs)
+    return z
 
 
 def height_above_bed(o, h):

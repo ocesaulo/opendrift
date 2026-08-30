@@ -61,10 +61,12 @@ def test_well_mixed_condition():
     orders of magnitude over the column. The classic failure mode is spurious
     accumulation where K is small, i.e. at both boundaries here.
 
-    The near-bed and near-surface tenths are excluded: the bed is not a
-    reflecting boundary in this model but a settle-and-resuspend cycle that
-    re-releases elements at a fixed reference height, which is a real boundary
-    treatment but not the one the well-mixed condition is posed for.
+    Only the near-bed tenth is excluded: the bed is not a reflecting boundary in
+    this model but a settle-and-resuspend cycle that re-releases elements at a
+    fixed reference height, which is a real boundary treatment but not the one
+    this condition is posed for. The surface *is* a reflecting boundary, so the
+    upper column -- where K collapses by four orders of magnitude -- is fair game
+    and is the more demanding of the two checks.
     """
     hours = 12
     ds = column_dataset(h=H, u=0.0, u_star=U_STAR, hours=hours + 1)
@@ -79,11 +81,19 @@ def test_well_mixed_condition():
           duration=datetime.timedelta(hours=hours), stop_on_error=True)
 
     zb = height_above_bed(o, H)
-    interior = (zb > 0.1 * H) & (zb < 0.9 * H)
-    counts, _ = np.histogram(zb[interior], bins=8, range=(0.1 * H, 0.9 * H))
-    expected = counts.sum() / len(counts)
-    # Poisson noise on ~600 per bin is ~4 %; allow 20 % excursions
-    assert np.all(np.abs(counts - expected) / expected < 0.20), counts
+
+    # Two regions. The interior is the weak check -- excluding the outer tenths
+    # also excludes most of the variation in K, which only spans ~3x there. The
+    # upper column is the strong one: the surface is a genuine reflecting
+    # boundary, so it can be probed right up to it, and K falls by four orders of
+    # magnitude across the top 30 % -- exactly where a biased scheme would pile
+    # elements up.
+    for lo_f, hi_f in [(0.10, 0.90), (0.70, 1.00)]:
+        lo, hi = lo_f * H, hi_f * H
+        counts, _ = np.histogram(zb[(zb > lo) & (zb < hi)], bins=8, range=(lo, hi))
+        expected = counts.sum() / len(counts)
+        # Poisson noise on a few hundred per bin is ~5 %; allow 20 % excursions
+        assert np.all(np.abs(counts - expected) / expected < 0.20), (lo_f, counts)
 
 
 @pytest.mark.slow
