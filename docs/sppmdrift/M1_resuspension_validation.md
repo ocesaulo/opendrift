@@ -23,11 +23,11 @@ Built, and defaulted on in production since 2026-06-19:
 
 | Piece | Where | Default |
 |---|---|---|
-| Bed stress, wave–current BBL | `sedimentdrift.py:983 _bottom_stress_sg2000` | `bbl_scheme='sg2000'` |
+| Bed stress, wave–current BBL | `sedimentdrift.py:986 _bottom_stress_sg2000` | `bbl_scheme='sg2000'` |
 | BBL-validity guard | same, routes on `dz_bot` vs `bbl_max_ref_height` | 10 m |
-| Dynamic erosion threshold | `sedimentdrift.py:768 _critical_shear_stress` | `tau_crit_mode='auto'` |
-| Resuspension height | `sedimentdrift.py:1272 calc_resuspension_height` | `resuspension_height_mode='turbulent'` |
-| Driver | `sedimentdrift.py:838 resuspension` | — |
+| Dynamic erosion threshold | `sedimentdrift.py:771 _critical_shear_stress` | `tau_crit_mode='auto'` |
+| Resuspension height | `sedimentdrift.py:1275 calc_resuspension_height` | `resuspension_height_mode='turbulent'` |
+| Driver | `sedimentdrift.py:841 resuspension` | — |
 
 Validated so far (all now in `tests/`, see M0):
 
@@ -231,10 +231,14 @@ deposition sequence and retention of the finest class.
 | | Finding | Fix belongs to |
 |---|---|---|
 | F1 | `mixed` threshold is not Sherwood Eq. 6: cohesive term uses the particle's own diameter rather than the bulk bed stress, and the `max(..., tau_c)` floor is missing. 0.6x to 14x wrong. | M2/B3 |
-| F2 | An all-or-nothing threshold cannot reproduce event-intensity scaling; a weaker second event resuspends 0.92x as much sand as the first, where the reference gives "minimal". | M2/B4 |
-| F3 | Settled elements above threshold re-lift **every step** — 299 lift-offs per sand particle over two events. **This is the mechanism behind the parent study's ~45 % fast-class domain loss.** | M2/B4 |
+| F2 | An all-or-nothing threshold cannot reproduce event-intensity scaling; a weaker second event resuspends 0.92x as much sand as the first, where the reference gives "minimal". | M2/B1 |
+| F3 | Settled elements above threshold re-lift **every step** — 299 lift-offs per sand particle over two events. **This is the mechanism behind the parent study's ~45 % fast-class domain loss.** | M2/B1 |
+| **F3b** | **The lift-off rate does not converge under timestep refinement** (+63 % over a 4× `dt` refinement). The count is set by how often `resuspension()` is called, not by the flow — so the transport it drives is numerical, not physical. **Decisive.** | M2/B1 |
 | F4 | No critical shear stress for deposition (`tau_d`, Krone); we deposit unconditionally. Not anticipated in this plan. | M2 (new) |
 | F6 | `times_resuspended` was `uint8` and wrapped silently at 255, corrupting its own diagnostic — and it is exported by the DDT production runs. Fixed to `uint32`. | **fixed** |
+
+Narrative assessment of what this means for the model as a whole:
+[validation/first_claude_assessment_M1_physics.txt](validation/first_claude_assessment_M1_physics.txt).
 
 Remaining to build: S2 (blocked in practice by F1), W1, W2, and an idealized
 wave-forced case.

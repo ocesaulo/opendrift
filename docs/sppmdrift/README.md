@@ -19,7 +19,7 @@ can do this today, and each is strong exactly where the other is weak.
 |---|--------|-------|------|
 | 0 | [Foundations](M0_foundations.md) — port, tests, fixtures | **done** 2026-08-29 | — |
 | 1 | [Resuspension validation](M1_resuspension_validation.md) | **Tier A + S3 + S1 run**; [report](validation/REPORT.md) | literature gate cleared |
-| 2 | [Burial & resuspension thresholds](M2_burial_and_thresholds.md) | planned; **M1 handed it 4 defects** | **literature gate open** |
+| 2 | [Bed physics: flux, thresholds, burial](M2_burial_and_thresholds.md) | **revised** after M1; scope decision awaiting review | **literature gate open** |
 | 3 | [Settling](M3_settling.md) | planned | **literature gate open** |
 | 4 | [Chemistry & the dissolved fraction](M4_chemistry_dissolved.md) | planned | **literature gate open** |
 | 5 | [Dynamic particle size](M5_dynamic_size.md) | proposed | **go/no-go pending** |
@@ -74,6 +74,7 @@ separation-of-concerns contract every module must respect, are in
 | Physics tests | `tests/models/test_{bblm_sg2000,floc_strength,rouse,settling,sedimentdrift_bbl}.py` |
 | Test fixtures | `tests/test_data/sppm/` (+ `PROVENANCE.md`) |
 | Validation report | `docs/sppmdrift/validation/REPORT.md` |
+| Physics assessment | `docs/sppmdrift/validation/first_claude_assessment_M1_physics.txt` |
 | Validation notebooks | `docs/sppmdrift/validation/notebooks/` (start at `00_overview.ipynb`) |
 | Papers | `ddt_dump/resuspension_mechanics/`, `ddt_dump/bblm_sg2000/` (external) |
 

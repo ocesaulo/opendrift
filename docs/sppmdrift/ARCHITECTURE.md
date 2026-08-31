@@ -111,7 +111,7 @@ SPPMDRIFT is the union:
 | Burial | none | a fixed matrix rate, built once at seed time |
 | Chemistry | none | partitioning, degradation, volatilization, 12 species |
 
-The symmetry points are clean — `bottom_interaction` (`sedimentdrift.py:753` /
+The symmetry points are clean — `bottom_interaction` (`sedimentdrift.py:756` /
 `chemicaldrift.py:1581`), `resuspension` (`:838` / `:1607`),
 `update_terminal_velocity` (`:685` / `:1114`) — but `ChemicalDrift`'s element
 class has only `diameter` and `density`, and its `required_variables` lack the
