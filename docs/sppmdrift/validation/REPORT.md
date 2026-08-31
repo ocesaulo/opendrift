@@ -23,10 +23,16 @@ analytic rate, and — in Sherwood's double-resuspension experiment — reproduc
 the class-ordered suspended load, the fining-upward deposition sequence and the
 retention of the finest class after five days.
 
-**The erosion side is not.** Three distinct defects were isolated, all of them
+**The erosion side is not.** Several defects were isolated, all of them
 consequences of resuspension being an all-or-nothing threshold crossing rather
-than a flux, plus one formulation error in the mixed-bed threshold. One of them
-is the direct mechanism behind a blocker in the parent DDT study.
+than a flux, plus one formulation error in the mixed-bed threshold. One is the
+direct mechanism behind a blocker in the parent DDT study, and one is decisive:
+**the scheme does not converge under timestep refinement** (F3b), so its
+resuspension counts — and the transport they drive — are numerical, not
+physical.
+
+A narrative assessment of what all this means for the model as a whole is in
+[`first_claude_assessment_M1_physics.txt`](first_claude_assessment_M1_physics.txt).
 
 ## Results
 
@@ -46,6 +52,7 @@ is the direct mechanism behind a blocker in the parent DDT study.
 | B | S1 fines retained at day 5 | suspended fraction | > 0.5 | "mostly suspended" | 0.64 | **pass** |
 | B | S1 second-event suppression | peak2 / peak1, 140 um | < 0.25 | "minimal" | 0.92 | **FAIL (F2)** |
 | B | S1 lift-offs per particle | mean, 140 um | a few | a few | 299 | **FAIL (F3)** |
+| B | Lift-off rate vs timestep | change over 4x dt refinement | ~0 % (convergent) | — | +63 % | **FAIL (F3b)** |
 | C | SG2000 Table 2 | max abs error, 15 entries | 0.15 | Table 2 | 0.000 | **pass** |
 | C | Settling vs Maggi (2013) | log10-RMSE, bb16 csf 0.7 | < 0.25 | — | 0.202 | **pass** |
 | C | Settling vs Maggi (2013) | log10-RMSE, dietrich | < 0.25 | — | 0.219 | **pass** |
@@ -72,7 +79,7 @@ tau_ce = max[ Pc * tau_cb + (1 - Pc) * tau_c , tau_c ]
 where `tau_cb` is the **bulk critical stress of the bed** — one value for every
 size class — and the result is floored at the particle's own `tau_c`.
 
-Ours (`sedimentdrift.py:768`, mode `mixed`) is
+Ours (`sedimentdrift.py:771`, mode `mixed`) is
 
 ```
 tau_crit = (1 - Pc) * tau_shields(d) + Pc * tau_floc(d, Df, phi)
@@ -140,7 +147,37 @@ displaces a particle downstream; three hundred hops is a large random-walk
 displacement that has nothing to do with the physics. Isolated here in a case
 with a known answer, the defect is unambiguous.
 
-F2 and F3 share a cause and would share a fix.
+### F3b — and the lift-off rate does not converge under timestep refinement
+
+Measured 2026-08-31. One class (140 um sand, tau_ce = 0.10 Pa, w_s = 8 mm/s),
+one half-sine event peaking at 1.0 Pa and spending 23.0 h above threshold, 200
+particles. **Only the outer timestep was varied:**
+
+| outer dt | steps above threshold | mean lift-offs | lift-offs / step |
+|---|---|---|---|
+| 900 s | 92 | 67.5 | 0.73 |
+| 450 s | 184 | 91.7 | 0.50 |
+| 225 s | 368 | 110.3 | 0.30 |
+
+Refining `dt` by 4x changes the answer by **+63 %**, monotonically, with no sign
+of approaching a limit. A physical quantity must converge as `dt -> 0`; this one
+is set by how often `resuspension()` is called. (The lift-offs/step ratio falls
+because a smaller step gives a grain more steps in which to fall back; the
+absolute count nevertheless keeps rising.)
+
+Because each lift-off lofts a grain into faster-moving water before it settles
+back, the resulting **horizontal transport inherits the same timestep
+dependence** — which is what makes the ~45 % fast-class domain loss in the
+parent study a numerical artifact rather than a physical export flux.
+
+This upgrades F3 from "too much resuspension" to **"not a convergent scheme"**. A
+miscalibrated threshold would still be physical, with a wrong constant; this is
+not that.
+
+Pinned by `test_s1_lift_off_rate_does_not_converge`, which is written to fail
+once the scheme becomes convergent — it is M2's acceptance gate.
+
+F2, F3 and F3b share a cause and would share a fix.
 
 ### F6 — `times_resuspended` was an 8-bit counter and wrapped silently
 

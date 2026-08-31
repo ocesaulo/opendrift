@@ -1,0 +1,195 @@
+Assessment of the SedimentDrift resuspension physics after the M1 campaign
+==========================================================================
+Written 2026-08-31 by Claude (Opus 5), at S. Soares' request, in answer to:
+"is the new code physically sound, is the resuspension behavior realistic and
+within expectations?"
+
+This is a judgement, not a test result. The measurements it rests on are in
+validation/REPORT.md and the notebooks in validation/notebooks/; the one new
+measurement made while answering (the timestep-convergence sweep) is recorded
+in section 4 below and has since been added to REPORT.md as F3b.
+
+
+VERDICT, IN TWO PARTS
+---------------------
+The supporting machinery is physically sound. The resuspension scheme is not.
+
+Those two are separable, and it matters that they are: everything that FEEDS
+resuspension -- settling velocity, vertical mixing, bed shear stress -- is
+validated against external references, so the defect is localised to the
+erosion step itself rather than being diffused through the model.
+
+
+1. WHAT IS SOLID
+----------------
+Each of these was checked against an external reference (published data, an
+analytic limit, or a published model result), not against the model's own
+self-consistency.
+
+  settling closures      log10-RMSE 0.20 against Maggi (2013) MEASURED grains;
+                         Stokes low-Re limit exact across three closures; the
+                         BB16 shape correction measurably improves the fit
+                         (0.219 -> 0.202)
+
+  vertical mixing        well-mixed condition holds to 10 % across the top 30 %
+                         of the column, where K falls by 33,600x. This is the
+                         region where a random walk missing the dK/dz term
+                         piles particles against the boundary; it does not
+
+  settling (x) mixing    Rouse exponent recovered within tolerance and the
+                         modelled profile tracks the analytic shape over two
+                         decades of concentration
+
+  bed shear stress       SG2000 kernel reproduces the published UserTestCase
+                         Table 2 to max abs error 0.000 (15 entries)
+
+  deposition             0.719 settled vs analytic w_s t / h = 0.720
+
+  class behaviour        Sherwood (2018) 3.2.1: suspended-load ordering by
+                         grain size, deposition sequence (140 -> 62.5 -> 30 um,
+                         4 um never), and retention of the finest class at
+                         day 5 all reproduced
+
+The last row is the important one for the science. The model gets the
+QUALITATIVE sediment behaviour right: coarse deposits first, fines stay up, a
+graded deposit forms. The physics of which class does what is correct.
+
+
+2. WHERE IT BREAKS
+------------------
+Resuspension is implemented as a PER-PARTICLE BINARY STATE CHANGE, where the
+real process is a MASS FLUX. Every settled element whose critical stress is
+exceeded is lifted, on every timestep, regardless of by how much. Three
+consequences follow, all from that single root cause:
+
+  (a) No intensity scaling  (F2)
+      A 0.45 Pa event resuspends 0.92x as much sand as a 1.00 Pa event.
+      Sherwood reports "minimal amounts" for the weaker event, because his
+      erosion is a flux proportional to the excess stress. A threshold
+      crossing has no notion of HOW FAR it was exceeded.
+
+  (b) The eroded amount is a numerical choice, not a physical one
+      Everything above threshold lifts, so the mass mobilised is set by how
+      many numerical particles happen to be resting on the bed. There is no
+      erodible-mass or active-layer constraint anywhere in the scheme.
+
+  (c) The rate does not converge  (F3)
+      See section 4. This is the decisive one.
+
+
+3. THE MIXED-BED THRESHOLD IS SEPARATELY WRONG  (F1)
+----------------------------------------------------
+Independent of the flux problem. Sherwood Eq. 6 blends the particle's own
+Shields stress toward the BULK BED stress, one value for every size class, and
+floors the result at the particle's own tau_c:
+
+    tau_ce = max[ Pc*tau_cb + (1-Pc)*tau_c , tau_c ]
+
+Ours blends toward a fractal floc strength computed from the PARTICLE'S OWN
+diameter, and omits the floor. A sand grain embedded in a mud matrix is
+therefore assigned the fictitious strength of a 140 um floc. Errors run 0.6x
+(clay, too easy to erode, because the floor is missing) to 14x (coarse sand,
+far too hard). The low-mud limit is exact, and the monotonicity in mud content
+is right, so the structure is sound and the cohesive limit is not.
+
+
+4. THE DECISIVE MEASUREMENT: THE SCHEME DOES NOT CONVERGE
+---------------------------------------------------------
+Made 2026-08-31 while writing this assessment. One class (140 um sand,
+tau_ce = 0.10 Pa, w_s = 8 mm/s), one half-sine stress event peaking at 1.0 Pa
+and spending 23.0 h above threshold, 200 particles. ONLY the outer timestep
+was varied:
+
+    dt [s]      steps above threshold    mean lift-offs    lift-offs/step
+    900                            92              67.5              0.73
+    450                           184              91.7              0.50
+    225                           368             110.3              0.30
+
+Refining dt by 4x changes the answer by +63 %, monotonically, with no sign of
+settling to a limit. A physical quantity must converge as dt -> 0. This one
+does not: the lift-off count is set by how often resuspension() happens to be
+called.
+
+The lift-offs/step ratio falls because a smaller step gives the particle more
+steps in which to fall back; the ABSOLUTE count nevertheless keeps rising.
+
+This matters beyond bookkeeping. Each lift-off lofts a grain into faster-moving
+water, where it is advected before settling back, so the resulting HORIZONTAL
+TRANSPORT inherits the same timestep dependence.
+
+This upgrades F3 from "too much resuspension" to "not a convergent scheme". A
+miscalibrated threshold would still be physical, with a wrong constant. This is
+not that.
+
+
+5. IS THE BEHAVIOUR "WITHIN EXPECTATIONS"?
+------------------------------------------
+No -- and specifically, it is worse than being merely too energetic.
+
+The practical picture is BIMODAL, with no well-behaved middle regime:
+
+  tau_crit ABOVE the ambient stress
+      Resuspension never fires. The run is effectively pure settling plus
+      advection. Defensible as a modelling choice, but the resuspension
+      physics is then inert and contributes nothing. This is what the bb16
+      production run did: 23 events over 19 particles. Under the production
+      default tau_crit_mode='auto', 31 um quartz falls below the 63 um cutoff,
+      is routed to the cohesive branch, and receives ~0.48 Pa against a legacy
+      prescribed value of 0.09 Pa.
+
+  tau_crit BELOW the ambient stress
+      Pathological hopping, as measured above. This is the mechanism behind
+      the ~45 % out-of-domain loss of the fastest settling classes that
+      currently blocks the class-weight inversion. THAT NUMBER IS A NUMERICAL
+      ARTIFACT, NOT A PHYSICAL EXPORT FLUX, and it would change if the
+      timestep changed.
+
+Anything sitting near the threshold inherits the worst of both.
+
+
+6. WHAT I WOULD AND WOULD NOT USE THIS CODE FOR TODAY
+-----------------------------------------------------
+  TRUST      settling, dispersal, deposition patterns, and the relative
+             behaviour of different particle classes. That chain is validated
+             against published measurements and analytic limits.
+
+  DO NOT     resuspension event counts; resuspension-driven export or domain
+  TRUST      loss; any erosion-intensity or storm-to-storm comparison; and
+             'mixed'-mode critical stresses (F1).
+
+Also note F6: times_resuspended was declared uint8 and wrapped silently at 255.
+It is in the export_variables list of the production runs, so resuspension
+counts in EXISTING output are corrupted wherever a particle exceeded 255
+lift-offs -- which, given section 4, the fast classes certainly did. Fixed to
+uint32; deposition and position fields are unaffected.
+
+
+7. THE FIX IS WELL-DEFINED
+--------------------------
+Replace the threshold crossing with an Ariathurai-Partheniades pickup flux,
+
+    E = E_0 (1 - phi) (tau_b / tau_c - 1)      [kg m-2 s-1]
+
+so erosion becomes a RATE with a mass constraint. That addresses F2 and F3
+together: it is intensity-scaled by construction, and the expected mass eroded
+per unit time is independent of dt, which is what makes it convergent. The stub
+(calc_upward_resuspension_velocity) already exists and now works, though its
+normalisation (tau - tau_c)/tau differs from the ROMS/COAWST form used above
+and that discrepancy is unresolved.
+
+The non-obvious prerequisite is that this needs a notion of ERODIBLE MASS PER
+UNIT BED AREA, which a Lagrangian model does not currently have: elements carry
+no mass at all. That is the real design work, and it is why the fix is a module
+rather than a patch.
+
+F1 and F4 (no critical shear stress for deposition, Krone tau_d) are
+independent, smaller, and also M2.
+
+
+8. WAS THE CAMPAIGN WORTH RUNNING?
+----------------------------------
+Yes. Three of these defects had been live in the PRODUCTION DEFAULTS since
+2026-06-19, and the diagnostic that would have exposed the hopping
+(times_resuspended) was itself silently broken by an 8-bit overflow. None of it
+was visible from the model's own outputs; all of it became visible within a day
+of comparing against published cases with known answers.

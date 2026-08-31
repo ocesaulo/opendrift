@@ -344,3 +344,58 @@ def test_s1_coarse_classes_hop_repeatedly(s1_run):
     per_particle = np.array(per_particle)
     assert np.all(np.diff(per_particle) > 0), per_particle   # worse for coarser
     assert per_particle[3] > 100.0, per_particle             # ~299 measured
+
+
+@pytest.mark.slow
+def test_s1_lift_off_rate_does_not_converge():
+    """DOCUMENTED FAILURE, and M2's acceptance gate.
+
+    The decisive property. A physical erosion rate must converge under timestep
+    refinement: halving dt must not change how much material leaves the bed.
+    Ours does change, because `resuspension()` lifts every settled element above
+    threshold once per outer step, so the lift-off count is set by how often the
+    routine is called rather than by the flow.
+
+    Measured over a single stress event on one class, varying only dt:
+
+        dt = 900 s -> 67.5 lift-offs;  450 s -> 91.7;  225 s -> 110.3
+
+    a +63 % change over a 4x refinement, monotonic, with no sign of a limit.
+    Since each lift-off lofts a grain into faster water before it settles back,
+    the horizontal transport inherits the same dependence.
+
+    This test asserts the *defect*. When the pickup flux of M2/B4 lands it must
+    start failing, and should then be inverted to assert convergence (the eroded
+    mass agreeing across dt to within sampling noise). Do not delete it.
+    """
+    import datetime
+    from .sppm_harness import column_dataset, column_model, stress_to_speed
+
+    depth, hours, n = 20.0, 30.0, 200
+    t = np.arange(0, hours + 1, 1.0)
+    tau = np.where((t >= 3) & (t <= 27), np.sin(np.pi * (t - 3) / 24), 0.0)
+
+    counts = {}
+    for dt in (900, 225):
+        ds = column_dataset(h=depth, u=stress_to_speed(tau), u_star=0.02,
+                            hours=hours, dt_hours=1.0, nz=81)
+        o, reader = column_model(
+            ds,
+            vertical_mixing__settling_model='prescribed',
+            vertical_mixing__tau_crit_mode='constant',
+            vertical_mixing__resuspension_height_mode='turbulent',
+            vertical_mixing__bbl_scheme='legacy',
+            vertical_mixing__resuspension_seed_layer=5.0)
+        np.random.seed(3)
+        o.seed_elements(
+            lon=8.0, lat=64.0, number=n, time=reader.start_time, z='seafloor',
+            terminal_velocity=np.full(n, -8.0e-3), tau_crit=np.full(n, 0.10),
+            grain_diameter=np.full(n, 140e-6), rho_s=np.full(n, 2650.0),
+            use_stokes=np.zeros(n), settled=np.ones(n), moving=np.zeros(n))
+        o.run(time_step=dt, time_step_output=3600,
+              duration=datetime.timedelta(hours=hours), stop_on_error=True)
+        counts[dt] = float(np.mean(o.elements.times_resuspended))
+
+    # a convergent scheme would agree within sampling noise; this one grows
+    growth = counts[225] / counts[900]
+    assert growth > 1.3, counts
